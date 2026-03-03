@@ -183,12 +183,42 @@ The `./scripts/run_cloudxr.sh` script will automatically:
 > **Note:** The first run may take a few minutes to download the SDK and build containers.
 > Subsequent runs will be faster as these are cached.
 
+#### Alternative: run CloudXR via local wheel
+
+If you prefer a non-Docker runtime/proxy flow, you can launch CloudXR and the WSS
+proxy together with:
+
+```bash
+./scripts/run_cloudxr_via_wheel.sh
+```
+
+This script runs the Python CloudXR runtime (`python -m isaacteleop.cloudxr`) and
+the Python WSS proxy (`python -m isaacteleop.cloudxr.wss`). If those modules are
+not importable in the current Python environment, it tries to bootstrap
+`isaacteleop[cloudxr]` from local wheels in `install/wheels` (or `build/wheels`).
+If no local wheel is found, the script will build and install one automatically.
+
+After the script starts, open a CloudXR.js client page.
+
+For convenience, you can use the hosted NVIDIA Isaac Teleop Web Client:
+`https://nvidia.github.io/IsaacTeleop/client/`
+
+In that page, set **Server IP** to your server IP (for example, `192.168.1.2`).
+
 7. **White list ports for Firewall**
 
-Open the [required CloudXR ports](https://docs.nvidia.com/cloudxr-sdk/latest/requirement/network_setup.html#ports-and-firewalls)
-and the web server ports for the WebXR client:
+Open the [required CloudXR ports](https://docs.nvidia.com/cloudxr-sdk/latest/requirement/network_setup.html#ports-and-firewalls).
+
+If you are running the web client on this machine:
+
 ```bash
 sudo ufw allow 47998/udp && sudo ufw allow 49100/tcp && sudo ufw allow 48322/tcp && sudo ufw allow 8080/tcp && sudo ufw allow 8443/tcp
+```
+
+If you are not running the web client locally you only need the ports for the runtime and proxy:
+
+```bash
+sudo ufw allow 47998/udp && sudo ufw allow 49100/tcp && sudo ufw allow 48322/tcp
 ```
 
 8. **WebXR Client Setup**
