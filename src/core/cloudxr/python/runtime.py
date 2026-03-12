@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import ctypes
+import glob
 import multiprocessing
 import os
 import shutil
@@ -19,10 +20,25 @@ _RUNTIME_JOIN_TIMEOUT = 10
 _RUNTIME_STARTUP_TIMEOUT_SEC = 10
 
 
-def check_eula() -> None:
-    """Require CloudXR EULA to be accepted; exits the process if not. Call from main process before spawning runtime."""
+def _write_eula_marker(marker: str) -> None:
+    run_dir = os.path.dirname(marker)
+    os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    with open(marker, "w") as f:
+        f.write("accepted\n")
+
+
+def check_eula(*, accept_eula: bool | None = None) -> None:
+    """Require CloudXR EULA to be accepted; exits the process if not. Call from main process before spawning runtime.
+
+    Args:
+        accept_eula: If True, accept and write marker. If None, check marker then prompt interactively.
+    """
     marker = os.path.join(get_env_config().openxr_run_dir(), "eula_accepted")
     if os.path.isfile(marker):
+        return
+
+    if accept_eula is True:
+        _write_eula_marker(marker)
         return
 
     print(
@@ -37,10 +53,7 @@ def check_eula() -> None:
         print("EULA not accepted. Exiting.", file=sys.stderr)
         sys.exit(1)
 
-    run_dir = os.path.dirname(marker)
-    os.makedirs(run_dir, mode=0o700, exist_ok=True)
-    with open(marker, "w") as f:
-        f.write("accepted\n")
+    _write_eula_marker(marker)
 
 
 def _get_sdk_path() -> str | None:
@@ -78,6 +91,26 @@ async def wait_for_runtime_ready(
 
     # Runtime startup timeout reached, assume the runtime is not ready
     return False
+
+
+def runtime_version() -> str:
+    """Query the CloudXR runtime version from the native library (major.minor.patch)."""
+    sdk_path = _get_sdk_path()
+    lib = ctypes.CDLL(os.path.join(sdk_path, "libcloudxr.so"))
+    if not hasattr(lib, "nv_cxr_get_runtime_version"):
+        return "unknown"
+    major, minor, patch = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint32()
+    lib.nv_cxr_get_runtime_version(
+        ctypes.byref(major), ctypes.byref(minor), ctypes.byref(patch)
+    )
+    return f"{major.value}.{minor.value}.{patch.value}"
+
+
+def latest_runtime_log() -> str | None:
+    """Return the path to the most recent cxr_server log file, or None if not found."""
+    logs_dir = get_env_config().ensure_logs_dir()
+    candidates = sorted(glob.glob(str(logs_dir / "cxr_server.*.log")))
+    return candidates[-1] if candidates else None
 
 
 def terminate_or_kill_runtime(process: multiprocessing.Process) -> None:
@@ -121,7 +154,6 @@ def run() -> None:
     sdk_path = _get_sdk_path()
     run_dir = cfg.openxr_run_dir()
     openxr_dir = _setup_openxr_dir(sdk_path, run_dir)
-    logs_dir_path = cfg.ensure_logs_dir()
 
     expected_json = os.path.join(openxr_dir, "openxr_cloudxr.json")
     for var, expected in (
@@ -138,13 +170,24 @@ def run() -> None:
                 f"{var} mismatch: environment has {actual!r}, expected {expected!r}"
             )
 
-    # CloudXR Runtime writes cxr_server.<timestamp>.log under NV_CXR_OUTPUT_DIR when
-    os.environ["XRT_NO_STDIN"] = "true"
-    os.environ["NV_CXR_FILE_LOGGING"] = "true"
-    os.environ["NV_CXR_OUTPUT_DIR"] = str(logs_dir_path)
-
     prev_ld = os.environ.get("LD_LIBRARY_PATH", "")
     os.environ["LD_LIBRARY_PATH"] = sdk_path + (f":{prev_ld}" if prev_ld else "")
+
+    # By default suppress native library console output (banner, StreamSDK redirect notice), so
+    # that we can have complete control over the console output.
+    _file_logging = os.environ.get("NV_CXR_FILE_LOGGING", "yes")
+    if _file_logging and _file_logging.lower() not in (
+        "false",
+        "off",
+        "no",
+        "n",
+        "f",
+        "0",
+    ):
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, sys.stdout.fileno())
+        os.dup2(devnull_fd, sys.stderr.fileno())
+        os.close(devnull_fd)
 
     lib_path = os.path.join(sdk_path, "libcloudxr.so")
     lib = ctypes.CDLL(lib_path)

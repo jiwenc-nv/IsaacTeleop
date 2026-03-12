@@ -11,11 +11,12 @@ The `mode` parameter selects the teleoperation scenario and which topics are
 published:
 
   - controller_teleop (default): ee_poses (from controller aim pose), root_twist, root_pose,
-                       and TF transforms for left/right wrists
-  - hand_teleop: ee_poses (from hand tracking wrist), hand (finger joints only),
+                       finger_joints (retargeted TriHand angles), and TF transforms for
+                       left/right wrists
+  - hand_teleop: ee_poses (from hand tracking wrist), hand (raw finger poses),
                  root_twist, root_pose, and TF transforms for left/right wrists
   - controller_raw: controller_data only
-  - full_body: full_body only
+  - full_body: full_body and controller_data
 
 Topic names (configurable via parameters):
   - xr_teleop/hand (PoseArray): [finger_joint_poses...]
@@ -24,6 +25,7 @@ Topic names (configurable via parameters):
   - xr_teleop/root_pose (PoseStamped): root pose command (height only)
   - xr_teleop/controller_data (ByteMultiArray): msgpack-encoded controller data
   - xr_teleop/full_body (ByteMultiArray): msgpack-encoded full body tracking data
+  - xr_teleop/finger_joints (JointState): retargeted TriHand finger joint angles (controller_teleop only)
 
 TF frames published in hand_teleop and controller_teleop modes (configurable via parameters):
   - world_frame -> right_wrist_frame
@@ -47,6 +49,7 @@ from geometry_msgs.msg import (
 )
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 from std_msgs.msg import ByteMultiArray
 from tf2_ros import TransformBroadcaster
 
@@ -59,6 +62,8 @@ from isaacteleop.retargeting_engine.interface import OptionalTensorGroup, Output
 from isaacteleop.retargeters import (
     LocomotionRootCmdRetargeter,
     LocomotionRootCmdRetargeterConfig,
+    TriHandMotionControllerRetargeter,
+    TriHandMotionControllerConfig,
 )
 from isaacteleop.retargeting_engine.tensor_types.indices import (
     BodyJointPicoIndex,
@@ -346,6 +351,20 @@ def _build_controller_payload(
     }
 
 
+_TRIHAND_JOINT_NAMES = [
+    "thumb_rotation",
+    "thumb_proximal",
+    "thumb_distal",
+    "index_proximal",
+    "index_distal",
+    "middle_proximal",
+    "middle_distal",
+]
+_FINGER_JOINT_NAMES = [f"left_{n}" for n in _TRIHAND_JOINT_NAMES] + [
+    f"right_{n}" for n in _TRIHAND_JOINT_NAMES
+]
+
+
 def _build_full_body_payload(full_body: OptionalTensorGroup) -> Dict:
     positions = np.asarray(full_body[FullBodyInputIndex.JOINT_POSITIONS])
     orientations = np.asarray(full_body[FullBodyInputIndex.JOINT_ORIENTATIONS])
@@ -372,6 +391,7 @@ class TeleopRos2PublisherNode(Node):
         self.declare_parameter("root_pose_topic", "xr_teleop/root_pose")
         self.declare_parameter("controller_topic", "xr_teleop/controller_data")
         self.declare_parameter("full_body_topic", "xr_teleop/full_body")
+        self.declare_parameter("finger_joints_topic", "xr_teleop/finger_joints")
         self.declare_parameter("rate_hz", 60.0)
         self.declare_parameter("mode", "controller_teleop")
         self.declare_parameter(
@@ -412,6 +432,9 @@ class TeleopRos2PublisherNode(Node):
         )
         self._full_body_topic = (
             self.get_parameter("full_body_topic").get_parameter_value().string_value
+        )
+        self._finger_joints_topic = (
+            self.get_parameter("finger_joints_topic").get_parameter_value().string_value
         )
         rate_hz = self.get_parameter("rate_hz").get_parameter_value().double_value
         if rate_hz <= 0 or not math.isfinite(rate_hz):
@@ -467,6 +490,9 @@ class TeleopRos2PublisherNode(Node):
         self._pub_full_body = self.create_publisher(
             ByteMultiArray, self._full_body_topic, 10
         )
+        self._pub_finger_joints = self.create_publisher(
+            JointState, self._finger_joints_topic, 10
+        )
 
         hands = HandsSource(name="hands")
         controllers = ControllersSource(name="controllers")
@@ -481,6 +507,25 @@ class TeleopRos2PublisherNode(Node):
             }
         )
 
+        left_hand_retargeter = TriHandMotionControllerRetargeter(
+            TriHandMotionControllerConfig(
+                hand_joint_names=_TRIHAND_JOINT_NAMES, controller_side="left"
+            ),
+            name="trihand_left",
+        )
+        right_hand_retargeter = TriHandMotionControllerRetargeter(
+            TriHandMotionControllerConfig(
+                hand_joint_names=_TRIHAND_JOINT_NAMES, controller_side="right"
+            ),
+            name="trihand_right",
+        )
+        left_hand_connected = left_hand_retargeter.connect(
+            {ControllersSource.LEFT: controllers.output(ControllersSource.LEFT)}
+        )
+        right_hand_connected = right_hand_retargeter.connect(
+            {ControllersSource.RIGHT: controllers.output(ControllersSource.RIGHT)}
+        )
+
         pipeline = OutputCombiner(
             {
                 "hand_left": hands.output(HandsSource.LEFT),
@@ -489,6 +534,8 @@ class TeleopRos2PublisherNode(Node):
                 "controller_right": controllers.output(ControllersSource.RIGHT),
                 "root_command": locomotion_connected.output("root_command"),
                 "full_body": full_body.output(FullBodySource.FULL_BODY),
+                "finger_joints_left": left_hand_connected.output("hand_joints"),
+                "finger_joints_right": right_hand_connected.output("hand_joints"),
             }
         )
 
@@ -573,7 +620,42 @@ class TeleopRos2PublisherNode(Node):
                                 pose_msg.pose.orientation.w = 1.0
                                 self._pub_root_pose.publish(pose_msg)
 
-                        if self._mode == "controller_raw":
+                        if self._mode == "controller_teleop":
+                            left_joints = result["finger_joints_left"]
+                            right_joints = result["finger_joints_right"]
+                            if not left_joints.is_none or not right_joints.is_none:
+                                finger_joints_msg = JointState()
+                                finger_joints_msg.header.stamp = now
+                                finger_joints_msg.header.frame_id = self._world_frame
+                                left_arr = (
+                                    np.asarray(list(left_joints), dtype=np.float32)
+                                    if not left_joints.is_none
+                                    else np.array([], dtype=np.float32)
+                                )
+                                right_arr = (
+                                    np.asarray(list(right_joints), dtype=np.float32)
+                                    if not right_joints.is_none
+                                    else np.array([], dtype=np.float32)
+                                )
+                                finger_joints_msg.name = (
+                                    list(
+                                        _FINGER_JOINT_NAMES[: len(_TRIHAND_JOINT_NAMES)]
+                                    )
+                                    if not left_joints.is_none
+                                    else []
+                                ) + (
+                                    list(
+                                        _FINGER_JOINT_NAMES[len(_TRIHAND_JOINT_NAMES) :]
+                                    )
+                                    if not right_joints.is_none
+                                    else []
+                                )
+                                finger_joints_msg.position = np.concatenate(
+                                    [left_arr, right_arr]
+                                ).tolist()
+                                self._pub_finger_joints.publish(finger_joints_msg)
+
+                        if self._mode in ("controller_raw", "full_body"):
                             if not left_ctrl.is_none or not right_ctrl.is_none:
                                 controller_payload = _build_controller_payload(
                                     left_ctrl, right_ctrl

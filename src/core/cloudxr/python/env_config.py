@@ -16,7 +16,18 @@ from pathlib import Path
 
 
 class EnvConfig:
-    """Singleton holding CloudXR env configuration and resolved state."""
+    """Singleton holding CloudXR env configuration and resolved state.
+
+    Configuration can come from three sources, with this precedence order:
+    1. Env file (highest precedence)
+    2. Process environment variables
+    3. Hard-coded defaults in this class (_DEFAULT_ENV)
+
+    Process environment variables are primarily intended for containerized
+    environments (for example Docker/docker-compose). For local development,
+    setting values via the env file is recommended over manually exporting
+    environment variables.
+    """
 
     _instance: "EnvConfig | None" = None
 
@@ -24,6 +35,7 @@ class EnvConfig:
     _RESOLVED_ONLY_KEYS: frozenset[str] = frozenset(
         {
             "XR_RUNTIME_JSON",
+            "XRT_NO_STDIN",
             "NV_CXR_RUNTIME_DIR",
             "NV_CXR_OUTPUT_DIR",
         }
@@ -36,7 +48,6 @@ class EnvConfig:
         "NV_CXR_OUTPUT_DIR": None,  # resolved from ensure_logs_dir()
         "NV_CXR_ENABLE_PUSH_DEVICES": "true",
         "NV_CXR_ENABLE_TENSOR_DATA": "true",
-        "XRT_NO_STDIN": "true",
         "NV_CXR_FILE_LOGGING": "true",
         "NV_DEVICE_PROFILE": "auto-webrtc",
     }
@@ -128,12 +139,13 @@ class EnvConfig:
         logs_dir = self.ensure_logs_dir()
         openxr_dir = os.path.dirname(run_dir)
 
-        path_vars = {
+        inferred_vars = {
             "XR_RUNTIME_JSON": os.path.join(openxr_dir, "openxr_cloudxr.json"),
             "NV_CXR_RUNTIME_DIR": run_dir,
             "NV_CXR_OUTPUT_DIR": str(logs_dir),
+            "XRT_NO_STDIN": "true",  # should always be true
         }
-        for k, v in path_vars.items():
+        for k, v in inferred_vars.items():
             env[k] = v
             os.environ[k] = v
 
@@ -169,7 +181,18 @@ class EnvConfig:
                     stacklevel=2,
                 )
                 del overrides[key]
+
         merged = self._merge_env(self._DEFAULT_ENV, overrides)
+
+        # Respect existing process environment values (e.g. docker-compose
+        # container env) unless explicitly overridden via env_file.
+        for key in self._DEFAULT_ENV:
+            if key in self._RESOLVED_ONLY_KEYS or key in overrides:
+                continue
+            value = os.environ.get(key)
+            if value is not None:
+                merged[key] = value
+
         return self._resolve_and_apply(merged)
 
     # -------------------------------------------------------------------------

@@ -11,10 +11,13 @@ import signal
 import sys
 from datetime import datetime, timezone
 
+from isaacteleop import __version__ as isaacteleop_version
 from isaacteleop.cloudxr.env_config import EnvConfig
 from isaacteleop.cloudxr.runtime import (
     check_eula,
+    latest_runtime_log,
     run as runtime_run,
+    runtime_version,
     terminate_or_kill_runtime,
     wait_for_runtime_ready,
 )
@@ -37,19 +40,29 @@ def _parse_args() -> argparse.Namespace:
         metavar="PATH",
         help="Optional env file (KEY=value per line) to override default CloudXR env vars",
     )
+    parser.add_argument(
+        "--accept-eula",
+        action="store_true",
+        help="Accept the NVIDIA CloudXR EULA non-interactively (e.g. for CI or containers).",
+    )
     return parser.parse_args()
 
 
 async def _main_async() -> None:
     args = _parse_args()
     env_cfg = EnvConfig.from_args(args.cloudxr_install_dir, args.cloudxr_env_config)
-    check_eula()
+    check_eula(accept_eula=args.accept_eula or None)
     logs_dir_path = env_cfg.ensure_logs_dir()
     wss_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     wss_log_path = logs_dir_path / f"wss.{wss_ts}.log"
 
     runtime_proc = multiprocessing.Process(target=runtime_run)
     runtime_proc.start()
+
+    cxr_ver = runtime_version()
+    print(
+        f"Running Isaac Teleop \033[36m{isaacteleop_version}\033[0m, CloudXR Runtime \033[36m{cxr_ver}\033[0m"
+    )
 
     try:
         ready = await wait_for_runtime_ready(runtime_proc)
@@ -61,13 +74,6 @@ async def _main_async() -> None:
             print("CloudXR runtime failed to start, terminating...")
             sys.exit(1)
 
-        print("CloudXR runtime started, make sure load environment variables:")
-        print("")
-        print("```bash")
-        print(f"source {env_cfg.env_filepath()}")
-        print("```")
-        print("")
-
         stop = asyncio.get_running_loop().create_future()
 
         def on_signal() -> None:
@@ -78,8 +84,17 @@ async def _main_async() -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, on_signal)
 
-        print("CloudXR WSS proxy: running")
-        print(f"        logFile:   {wss_log_path}")
+        cxr_log = latest_runtime_log() or logs_dir_path
+        print(
+            f"CloudXR runtime:   \033[36mrunning\033[0m, log file: \033[90m{cxr_log}\033[0m"
+        )
+        print(
+            f"CloudXR WSS proxy: \033[36mrunning\033[0m, log file: \033[90m{wss_log_path}\033[0m"
+        )
+        print(
+            f"Activate CloudXR environment in another terminal: \033[1;32msource {env_cfg.env_filepath()}\033[0m"
+        )
+        print("\033[33mKeep this terminal open, Ctrl+C to terminate.\033[0m")
 
         await wss_run(log_file_path=wss_log_path, stop_future=stop)
     finally:

@@ -45,6 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes-dev \
     libxxf86vm-dev \
     swig \
+    ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv via standalone script (avoids PEP 668 "externally managed" pip on Ubuntu 24.04 / Jazzy)
@@ -109,7 +110,9 @@ WORKDIR /opt/isaacteleop/install/examples/teleop_ros2/python
 # Copy requirements from the context, avoiding any files from the 'builder' stage.
 COPY src/core/python/requirements.txt src/core/python/requirements-retargeters.txt /tmp/
 RUN uv venv --python=${PYTHON_VERSION} && \
-    uv pip install -r /tmp/requirements.txt -r /tmp/requirements-retargeters.txt msgpack msgpack-numpy && \
+    uv pip install setuptools wheel && \
+    uv pip install --no-build-isolation-package nlopt \
+        -r /tmp/requirements.txt -r /tmp/requirements-retargeters.txt msgpack msgpack-numpy && \
     rm /tmp/requirements.txt /tmp/requirements-retargeters.txt
 
 COPY --from=builder /opt/isaacteleop/install /opt/isaacteleop/install
