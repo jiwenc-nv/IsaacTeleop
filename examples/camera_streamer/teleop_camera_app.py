@@ -19,7 +19,6 @@ import time
 from holoscan.core import Application, MetadataPolicy
 from holoscan.schedulers import EventBasedScheduler
 from loguru import logger
-
 from teleop_camera_subgraph import (
     DisplayMode,
     TeleopCameraSubgraph,

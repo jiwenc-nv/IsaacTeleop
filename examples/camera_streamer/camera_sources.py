@@ -8,8 +8,9 @@ teleop_camera_sender (RTP streaming) and teleop_camera_subgraph (local display).
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any
 
+from camera_config import CameraConfig
 from holoscan.operators import (
     FormatConverterOp,
     V4L2VideoCaptureOp,
@@ -17,18 +18,16 @@ from holoscan.operators import (
 )
 from loguru import logger
 
-from camera_config import CameraConfig
-
 # ZED and NVENC support are optional — loaded lazily and independently
 # so a V4L2-only setup doesn't need ZED SDK, and an OAK-D-only setup
 # doesn't need NVENC.
-_ZedCameraOp: Optional[Type] = None
-_NvStreamEncoderOp: Optional[Type] = None
-_zed_import_error: Optional[str] = None
-_nvenc_import_error: Optional[str] = None
+_ZedCameraOp: type | None = None
+_NvStreamEncoderOp: type | None = None
+_zed_import_error: str | None = None
+_nvenc_import_error: str | None = None
 
 
-def ensure_zed_support() -> Type:
+def ensure_zed_support() -> type:
     """Import and return ZedCameraOp. Raises ImportError if ZED SDK is unavailable."""
     global _ZedCameraOp, _zed_import_error
 
@@ -48,7 +47,7 @@ def ensure_zed_support() -> Type:
         raise ImportError(_zed_import_error) from e
 
 
-def ensure_nvenc_support() -> Type:
+def ensure_nvenc_support() -> type:
     """Import and return NvStreamEncoderOp. Raises ImportError if NVENC is unavailable."""
     global _NvStreamEncoderOp, _nvenc_import_error
 
@@ -76,13 +75,13 @@ class CameraSourceResult:
     into a Holoscan graph.
     """
 
-    operators: List[Any] = field(default_factory=list)
+    operators: list[Any] = field(default_factory=list)
     """All operators created (caller must add_operator or add_flow)."""
 
-    flows: List[Tuple[Any, Any, Dict]] = field(default_factory=list)
+    flows: list[tuple[Any, Any, dict]] = field(default_factory=list)
     """Flow connections: (src_op, dst_op, port_map)."""
 
-    frame_outputs: Dict[str, Tuple[Any, str]] = field(default_factory=dict)
+    frame_outputs: dict[str, tuple[Any, str]] = field(default_factory=dict)
     """Frame outputs keyed by stream name (e.g. 'left', 'right', 'mono').
     Each value is (operator, output_port_name)."""
 
@@ -214,8 +213,7 @@ def create_oakd_source(
             result.frame_outputs["mono"] = (oakd_source, "left_frame")
 
     logger.info(
-        f"  OAK-D source: {cam_name} {cam_cfg.width}x{cam_cfg.height}@{cam_cfg.fps}fps"
-        f" ({output_format})"
+        f"  OAK-D source: {cam_name} {cam_cfg.width}x{cam_cfg.height}@{cam_cfg.fps}fps ({output_format})"
     )
     return result
 
@@ -310,8 +308,7 @@ def create_video_file_source(
     """
     if not cam_cfg.video_dir or not cam_cfg.video_basename:
         raise ValueError(
-            f"Camera '{cam_name}': video_file type requires 'video_dir' and "
-            f"'video_basename' to be set"
+            f"Camera '{cam_name}': video_file type requires 'video_dir' and 'video_basename' to be set"
         )
 
     replayer = VideoStreamReplayerOp(

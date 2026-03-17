@@ -16,18 +16,15 @@ Metadata emitted with each frame/packet:
     - sequence: Frame sequence number for drop detection (int)
 """
 
-import time
 from enum import Enum
-from typing import Optional
+import time
 
 import cupy as cp
 import depthai as dai
-import numpy as np
-from loguru import logger
-
 from holoscan import as_tensor
 from holoscan.core import ConditionType, Operator, OperatorSpec
-
+from loguru import logger
+import numpy as np
 
 STATS_INTERVAL_SEC = 30.0
 
@@ -144,8 +141,8 @@ class OakdCameraOp(Operator):
         self._quality = quality
 
         # Device and pipeline state
-        self._device: Optional[dai.Device] = None
-        self._pipeline: Optional[dai.Pipeline] = None
+        self._device: dai.Device | None = None
+        self._pipeline: dai.Pipeline | None = None
 
         # Output queues (H264 mode)
         self._h264_queue = None
@@ -157,8 +154,10 @@ class OakdCameraOp(Operator):
 
         # Stats
         self._frame_count = 0
+        self._frame_count_right = 0
         self._last_log_time = 0.0
         self._last_log_count = 0
+        self._last_log_count_right = 0
 
         # Reconnection state
         self._consecutive_failures = 0
@@ -180,7 +179,7 @@ class OakdCameraOp(Operator):
                 spec.output("h264_packets_right").condition(ConditionType.NONE)
 
     def _get_camera_socket(
-        self, socket_name: Optional[str] = None
+        self, socket_name: str | None = None
     ) -> dai.CameraBoardSocket:
         """Map camera socket string to DepthAI enum."""
         name = (socket_name or self._camera_socket).upper()
@@ -207,8 +206,7 @@ class OakdCameraOp(Operator):
         }
         if self._profile not in profile_map:
             raise ValueError(
-                f"Unknown H.264 profile '{self._profile}' "
-                f"(valid: {set(profile_map.keys())})"
+                f"Unknown H.264 profile '{self._profile}' (valid: {set(profile_map.keys())})"
             )
         return profile_map[self._profile]
 
@@ -224,12 +222,11 @@ class OakdCameraOp(Operator):
             quality=self._quality,
         )
 
-        # Configure encoder for ultra-low latency
         try:
             encoder.setNumFramesPool(3)
             encoder.setRateControlMode(dai.VideoEncoderProperties.RateControlMode.CBR)
             encoder.setKeyframeFrequency(self._gop_size)
-            encoder.setNumBFrames(0)  # No B-frames for low latency
+            encoder.setNumBFrames(0)
         except Exception as e:
             if self._verbose:
                 logger.warning(f"Some encoder settings not available: {e}")
@@ -251,16 +248,23 @@ class OakdCameraOp(Operator):
         return device_info
 
     def _create_pipeline(self) -> bool:
-        """Create the DepthAI pipeline for the configured mode and output format."""
+        """Create the DepthAI pipeline for the configured mode and output format.
+
+        Stereo raw mode uses GRAY8 over USB to minimize bandwidth (mono sensors
+        produce grayscale anyway). Gray-to-BGRA conversion happens on the host GPU.
+        """
         try:
             device_info = self._get_device_info()
             self._device = dai.Device(device_info)
             pipeline = dai.Pipeline(self._device)
 
             is_h264 = self._output_format == OakdOutputFormat.H264
-            frame_type = (
-                dai.ImgFrame.Type.NV12 if is_h264 else dai.ImgFrame.Type.BGR888p
-            )
+            if is_h264:
+                frame_type = dai.ImgFrame.Type.NV12
+            elif self._mode == OakdCameraMode.STEREO:
+                frame_type = dai.ImgFrame.Type.GRAY8
+            else:
+                frame_type = dai.ImgFrame.Type.BGR888p
 
             left_socket = (
                 self._get_camera_socket()
@@ -319,6 +323,7 @@ class OakdCameraOp(Operator):
         self._close_camera()
 
         if not self._create_pipeline():
+            self._close_camera()
             return False
 
         try:
@@ -327,6 +332,18 @@ class OakdCameraOp(Operator):
             logger.warning(f"Failed to start OAK-D pipeline: {e}")
             self._close_camera()
             return False
+
+        # Pre-allocate 4-ch BGRA GPU buffers for raw mode (NVENC sender path).
+        # The RGB local-display path (color_format="rgb") produces 3-ch tensors
+        # and skips these buffers; the per-frame cost is negligible there.
+        if self._output_format == OakdOutputFormat.RAW:
+            self._bgra_buf = cp.empty((self._height, self._width, 4), dtype=cp.uint8)
+            self._bgra_buf[:, :, 3] = 255
+            if self._mode == OakdCameraMode.STEREO:
+                self._bgra_buf_right = cp.empty(
+                    (self._height, self._width, 4), dtype=cp.uint8
+                )
+                self._bgra_buf_right[:, :, 3] = 255
 
         # Reset state on success
         self._consecutive_failures = 0
@@ -371,9 +388,18 @@ class OakdCameraOp(Operator):
         self._frame_queue_right = None
 
     def start(self):
-        """Initialize DepthAI pipeline and start camera."""
+        """Initialize DepthAI pipeline and start camera.
+
+        If the camera is not connected, logs a warning and defers to
+        the reconnection logic in compute() instead of crashing the graph.
+        """
         if not self._open_camera():
-            raise RuntimeError("Failed to open OAK-D camera on startup")
+            device_str = self._device_id or "auto-detect"
+            logger.warning(
+                f"OAK-D camera '{self.name}' not available on startup "
+                f"(device={device_str}). Will retry every {RECONNECT_DELAY_SEC}s."
+            )
+            self._is_disconnected = True
 
     def stop(self):
         """Stop DepthAI pipeline and release resources."""
@@ -402,134 +428,226 @@ class OakdCameraOp(Operator):
 
             if emitted:
                 self._consecutive_failures = 0
-                self._frame_count += 1
+                if self._mode == OakdCameraMode.MONO:
+                    self._frame_count += 1
                 self._log_stats()
         except Exception as e:
             self._handle_failure(f"emit failed: {e}")
 
     def _emit_raw_frames(self, op_output) -> bool:
-        """Emit raw frame(s). Returns True if left/main frame was emitted."""
-        if not self._frame_queue or not self._frame_queue.has():
-            return False
+        """Emit raw frame(s). Returns True if any frame was emitted."""
+        emitted = False
 
-        try:
-            frame_msg = self._frame_queue.get()
-        except Exception as e:
-            if self._verbose:
-                logger.warning(f"Failed to get frame: {e}")
-            return False
-
-        frame_data = self._extract_raw_frame(frame_msg)
-        if frame_data is None:
-            return False
-
-        self.metadata["frame_timestamp_us"] = self._extract_timestamp_us(frame_msg)
-        self.metadata["stream_id"] = self._left_stream_id
-        self.metadata["sequence"] = self._frame_count
-        op_output.emit(
-            as_tensor(frame_data), "left_frame", emitter_name="holoscan::Tensor"
-        )
-
-        if (
-            self._mode == OakdCameraMode.STEREO
-            and self._frame_queue_right
-            and self._frame_queue_right.has()
-        ):
+        if self._mode == OakdCameraMode.MONO:
+            if not self._frame_queue or not self._frame_queue.has():
+                return False
             try:
-                frame_right = self._frame_queue_right.get()
-                right_data = self._extract_raw_frame(frame_right)
-                if right_data is not None:
-                    self.metadata.clear()
-                    self.metadata["frame_timestamp_us"] = self._extract_timestamp_us(
-                        frame_right
-                    )
-                    self.metadata["stream_id"] = self._right_stream_id
-                    self.metadata["sequence"] = self._frame_count
-                    op_output.emit(
-                        as_tensor(right_data),
-                        "right_frame",
-                        emitter_name="holoscan::Tensor",
-                    )
-            except Exception:
-                logger.warning("Right-eye raw frame failed", exc_info=True)
+                frame_msg = self._frame_queue.get()
+            except Exception as e:
+                if self._verbose:
+                    logger.warning(f"Failed to get frame: {e}")
+                return False
 
-        return True
+            buf = getattr(self, "_bgra_buf", None)
+            frame_data = self._extract_raw_frame(frame_msg, buf)
+            if frame_data is None:
+                return False
+
+            self.metadata["frame_timestamp_us"] = self._extract_timestamp_us(frame_msg)
+            self.metadata["stream_id"] = self._left_stream_id
+            self.metadata["sequence"] = self._frame_count
+            op_output.emit(
+                as_tensor(frame_data), "left_frame", emitter_name="holoscan::Tensor"
+            )
+            emitted = True
+        else:
+            # Stereo: handle left and right independently
+            if self._frame_queue and self._frame_queue.has():
+                try:
+                    frame_left = self._frame_queue.get()
+                    left_data = self._extract_raw_frame(
+                        frame_left, getattr(self, "_bgra_buf", None)
+                    )
+                    if left_data is not None:
+                        self.metadata.clear()
+                        self.metadata["frame_timestamp_us"] = (
+                            self._extract_timestamp_us(frame_left)
+                        )
+                        self.metadata["stream_id"] = self._left_stream_id
+                        self.metadata["sequence"] = self._frame_count
+                        op_output.emit(
+                            as_tensor(left_data),
+                            "left_frame",
+                            emitter_name="holoscan::Tensor",
+                        )
+                        self._frame_count += 1
+                        emitted = True
+                except Exception as e:
+                    if self._verbose:
+                        logger.warning(f"Failed to emit left raw frame: {e}")
+
+            if self._frame_queue_right and self._frame_queue_right.has():
+                try:
+                    frame_right = self._frame_queue_right.get()
+                    right_data = self._extract_raw_frame(
+                        frame_right, getattr(self, "_bgra_buf_right", None)
+                    )
+                    if right_data is not None:
+                        self.metadata.clear()
+                        self.metadata["frame_timestamp_us"] = (
+                            self._extract_timestamp_us(frame_right)
+                        )
+                        self.metadata["stream_id"] = self._right_stream_id
+                        self.metadata["sequence"] = self._frame_count_right
+                        op_output.emit(
+                            as_tensor(right_data),
+                            "right_frame",
+                            emitter_name="holoscan::Tensor",
+                        )
+                        self._frame_count_right += 1
+                        emitted = True
+                except Exception as e:
+                    if self._verbose:
+                        logger.warning(f"Failed to emit right raw frame: {e}")
+
+        return emitted
 
     def _emit_h264_packets(self, op_output) -> bool:
-        """Emit H.264 packet(s). Returns True if left/main packet was emitted."""
-        if not self._h264_queue or not self._h264_queue.has():
-            return False
+        """Emit H.264 packet(s). Returns True if any packet was emitted."""
+        emitted = False
 
-        try:
-            encoded_msg = self._h264_queue.get()
-        except Exception as e:
-            if self._verbose:
-                logger.warning(f"Failed to get encoded frame: {e}")
-            return False
-
-        h264_data = self._extract_h264_data(encoded_msg)
-        if h264_data is None:
-            return False
-
-        self.metadata["frame_timestamp_us"] = self._extract_timestamp_us(encoded_msg)
-        self.metadata["stream_id"] = self._left_stream_id
-        self.metadata["sequence"] = self._frame_count
-        op_output.emit(
-            as_tensor(np.frombuffer(h264_data, dtype=np.uint8).copy()),
-            "h264_packets",
-        )
-
-        if (
-            self._mode == OakdCameraMode.STEREO
-            and self._h264_queue_right
-            and self._h264_queue_right.has()
-        ):
+        if self._mode == OakdCameraMode.MONO:
+            if not self._h264_queue or not self._h264_queue.has():
+                return False
             try:
-                encoded_right = self._h264_queue_right.get()
-                right_data = self._extract_h264_data(encoded_right)
-                if right_data is not None:
-                    self.metadata.clear()
-                    self.metadata["frame_timestamp_us"] = self._extract_timestamp_us(
-                        encoded_right
-                    )
-                    self.metadata["stream_id"] = self._right_stream_id
-                    self.metadata["sequence"] = self._frame_count
-                    op_output.emit(
-                        as_tensor(np.frombuffer(right_data, dtype=np.uint8).copy()),
-                        "h264_packets_right",
-                    )
-            except Exception:
-                logger.warning("Right-eye H.264 packet failed", exc_info=True)
+                encoded_msg = self._h264_queue.get()
+            except Exception as e:
+                if self._verbose:
+                    logger.warning(f"Failed to get encoded frame: {e}")
+                return False
 
-        return True
+            h264_data = self._extract_h264_data(encoded_msg)
+            if h264_data is None:
+                return False
 
-    def _extract_raw_frame(self, frame_msg) -> Optional[cp.ndarray]:
-        """Extract raw frame and convert to GPU tensor."""
-        try:
-            if isinstance(frame_msg, dai.ImgFrame):
-                frame = frame_msg.getCvFrame()
-                if frame is None:
-                    return None
-
-                if len(frame.shape) == 3 and frame.shape[2] == 3:
-                    if self._color_format == "rgb":
-                        frame = frame[:, :, ::-1]
-                    else:
-                        frame = np.concatenate(
-                            [
-                                frame,
-                                np.full((*frame.shape[:2], 1), 255, dtype=np.uint8),
-                            ],
-                            axis=2,
+            self.metadata["frame_timestamp_us"] = self._extract_timestamp_us(
+                encoded_msg
+            )
+            self.metadata["stream_id"] = self._left_stream_id
+            self.metadata["sequence"] = self._frame_count
+            op_output.emit(
+                as_tensor(np.frombuffer(h264_data, dtype=np.uint8).copy()),
+                "h264_packets",
+            )
+            emitted = True
+        else:
+            # Stereo: handle left and right independently
+            if self._h264_queue and self._h264_queue.has():
+                try:
+                    encoded_left = self._h264_queue.get()
+                    left_data = self._extract_h264_data(encoded_left)
+                    if left_data is not None:
+                        self.metadata.clear()
+                        self.metadata["frame_timestamp_us"] = (
+                            self._extract_timestamp_us(encoded_left)
                         )
+                        self.metadata["stream_id"] = self._left_stream_id
+                        self.metadata["sequence"] = self._frame_count
+                        packet_left = np.frombuffer(left_data, dtype=np.uint8).copy()
+                        op_output.emit(as_tensor(packet_left), "h264_packets")
+                        self._frame_count += 1
+                        emitted = True
+                except Exception as e:
+                    if self._verbose:
+                        logger.warning(f"Failed to emit left H.264 packet: {e}")
 
-                return cp.asarray(frame)
+            if self._h264_queue_right and self._h264_queue_right.has():
+                try:
+                    encoded_right = self._h264_queue_right.get()
+                    right_data = self._extract_h264_data(encoded_right)
+                    if right_data is not None:
+                        self.metadata.clear()
+                        self.metadata["frame_timestamp_us"] = (
+                            self._extract_timestamp_us(encoded_right)
+                        )
+                        self.metadata["stream_id"] = self._right_stream_id
+                        self.metadata["sequence"] = self._frame_count_right
+                        packet_right = np.frombuffer(right_data, dtype=np.uint8).copy()
+                        op_output.emit(as_tensor(packet_right), "h264_packets_right")
+                        self._frame_count_right += 1
+                        emitted = True
+                except Exception as e:
+                    if self._verbose:
+                        logger.warning(f"Failed to emit right H.264 packet: {e}")
+
+        return emitted
+
+    def _extract_raw_frame(
+        self, frame_msg, buf: cp.ndarray | None = None
+    ) -> cp.ndarray | None:
+        """Extract raw frame and convert to GPU tensor (BGRA).
+
+        Handles GRAY8 (mono sensors) and BGR888p (color sensors).
+        Output is always HxWx4 BGRA on GPU for NVENC compatibility.
+        If *buf* is provided and dimensions match, writes into it to avoid allocation.
+        """
+        try:
+            if not isinstance(frame_msg, dai.ImgFrame):
+                return None
+
+            frame = frame_msg.getCvFrame()
+            if frame is None:
+                return None
+
+            gpu = cp.asarray(frame)
+
+            if gpu.ndim == 2:
+                # GRAY8: all channels are identical; output shape depends on
+                # color_format (rgb/bgr → 3-ch, bgra → 4-ch with alpha).
+                if self._color_format in ("rgb", "bgr"):
+                    if (
+                        buf is not None
+                        and buf.shape[:2] == gpu.shape
+                        and buf.shape[2] == 3
+                    ):
+                        buf[:, :, 0] = gpu
+                        buf[:, :, 1] = gpu
+                        buf[:, :, 2] = gpu
+                        return buf
+                    rgb = cp.empty((*gpu.shape, 3), dtype=cp.uint8)
+                    rgb[:, :, 0] = gpu
+                    rgb[:, :, 1] = gpu
+                    rgb[:, :, 2] = gpu
+                    return rgb
+                # Default: BGRA (4-ch) for NVENC compatibility
+                if buf is not None and buf.shape[:2] == gpu.shape and buf.shape[2] == 4:
+                    buf[:, :, 0] = gpu
+                    buf[:, :, 1] = gpu
+                    buf[:, :, 2] = gpu
+                    return buf
+                bgra = cp.empty((*gpu.shape, 4), dtype=cp.uint8)
+                bgra[:, :, 0] = gpu
+                bgra[:, :, 1] = gpu
+                bgra[:, :, 2] = gpu
+                bgra[:, :, 3] = 255
+                return bgra
+
+            if gpu.ndim == 3 and gpu.shape[2] == 3:
+                if self._color_format == "rgb":
+                    return cp.ascontiguousarray(gpu[:, :, ::-1])
+                if buf is not None and buf.shape[:2] == gpu.shape[:2]:
+                    buf[:, :, :3] = gpu
+                    return buf
+                alpha = cp.full((*gpu.shape[:2], 1), 255, dtype=cp.uint8)
+                return cp.concatenate([gpu, alpha], axis=2)
+
+            return gpu
         except Exception as e:
             if self._verbose:
                 logger.warning(f"Failed to extract raw frame: {e}")
         return None
 
-    def _extract_h264_data(self, encoded_msg) -> Optional[bytes]:
+    def _extract_h264_data(self, encoded_msg) -> bytes | None:
         """Extract H.264 data from encoded message."""
         if isinstance(encoded_msg, dai.EncodedFrame):
             data = encoded_msg.getData()
@@ -571,14 +689,16 @@ class OakdCameraOp(Operator):
         self._last_reconnect_time = now
         self._reconnect_attempts += 1
 
-        logger.info(f"OAK-D camera reconnection attempt #{self._reconnect_attempts}...")
+        device_str = self._device_id or "auto-detect"
+        logger.info(
+            f"OAK-D '{self.name}' reconnection attempt #{self._reconnect_attempts} (device={device_str})..."
+        )
 
         if self._open_camera():
-            logger.info("OAK-D camera reconnected successfully!")
+            logger.info(f"OAK-D '{self.name}' reconnected successfully!")
         else:
             logger.warning(
-                f"OAK-D camera reconnection failed. "
-                f"Next attempt in {RECONNECT_DELAY_SEC}s..."
+                f"OAK-D '{self.name}' reconnection failed. Next attempt in {RECONNECT_DELAY_SEC}s..."
             )
 
     def _log_stats(self):
@@ -587,10 +707,21 @@ class OakdCameraOp(Operator):
         elapsed = now - self._last_log_time
 
         if elapsed >= STATS_INTERVAL_SEC:
-            frames = self._frame_count - self._last_log_count
-            fps = frames / elapsed
+            left_frames = self._frame_count - self._last_log_count
+            left_fps = left_frames / elapsed
 
-            logger.info(f"OAK-D camera | fps={fps:.1f} | total={self._frame_count}")
+            if self._mode == OakdCameraMode.STEREO:
+                right_frames = self._frame_count_right - self._last_log_count_right
+                right_fps = right_frames / elapsed
+                logger.info(
+                    f"OAK-D camera | left={left_fps:.1f}fps right={right_fps:.1f}fps "
+                    f"| total L={self._frame_count} R={self._frame_count_right}"
+                )
+                self._last_log_count_right = self._frame_count_right
+            else:
+                logger.info(
+                    f"OAK-D camera | fps={left_fps:.1f} | total={self._frame_count}"
+                )
 
             self._last_log_time = now
             self._last_log_count = self._frame_count

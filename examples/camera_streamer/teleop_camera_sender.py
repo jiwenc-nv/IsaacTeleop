@@ -13,23 +13,20 @@ Usage:
 """
 
 import argparse
+from dataclasses import dataclass
 import os
 import sys
-from dataclasses import dataclass
-from typing import Dict, List
 
-import yaml
+from camera_config import CameraConfig, validate_camera_configs
+from camera_sources import create_camera_source, ensure_nvenc_support
 from holoscan.core import Application
 from holoscan.resources import UnboundedAllocator
 from holoscan.schedulers import EventBasedScheduler
 from loguru import logger
-
 from operators.gstreamer_h264_sender.gstreamer_h264_sender_op import (
     GStreamerH264SenderOp,
 )
-from camera_config import CameraConfig, validate_camera_configs
-from camera_sources import create_camera_source, ensure_nvenc_support
-
+import yaml
 
 # -----------------------------------------------------------------------------
 # Sender Configuration
@@ -43,13 +40,13 @@ class TeleopCameraSenderConfig:
     host: str
     """Receiver IP address."""
 
-    cameras: Dict[str, CameraConfig]
+    cameras: dict[str, CameraConfig]
     """Camera configurations keyed by camera name."""
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "TeleopCameraSenderConfig":
         """Load configuration from YAML file."""
-        with open(yaml_path, "r") as f:
+        with open(yaml_path) as f:
             data = yaml.safe_load(f)
 
         source = data.get("source", "rtp")
@@ -71,7 +68,7 @@ class TeleopCameraSenderConfig:
             cameras=cameras,
         )
 
-    def get_cameras_by_type(self, camera_type: str) -> Dict[str, CameraConfig]:
+    def get_cameras_by_type(self, camera_type: str) -> dict[str, CameraConfig]:
         """Get camera configurations filtered by type."""
         return {
             name: cfg
@@ -79,7 +76,7 @@ class TeleopCameraSenderConfig:
             if cfg.camera_type == camera_type
         }
 
-    def validate(self) -> List[str]:
+    def validate(self) -> list[str]:
         """Validate configuration and return list of errors."""
         errors = validate_camera_configs(self.cameras)
 
@@ -155,18 +152,30 @@ class TeleopCameraSenderApp(Application):
         cuda_device = self._cuda_device
         allocator = UnboundedAllocator(self, name="allocator")
 
-        # ZED and V4L2 cameras output raw frames — need NVENC for H.264 encoding.
+        # ZED, V4L2, and stereo OAK-D cameras output raw frames — need NVENC.
+        # (VPU can't sustain dual H.264 at full framerate, so stereo OAK-D
+        # uses raw frames with host GPU NVENC encoding.)
         NvStreamEncoderOp = None
-        if self._config.get_cameras_by_type("zed") or self._config.get_cameras_by_type(
-            "v4l2"
+        has_stereo_oakd = any(
+            c.stereo for c in self._config.get_cameras_by_type("oakd").values()
+        )
+        if (
+            self._config.get_cameras_by_type("zed")
+            or self._config.get_cameras_by_type("v4l2")
+            or has_stereo_oakd
         ):
             NvStreamEncoderOp = ensure_nvenc_support()
 
         for cam_name, cam_cfg in self._config.cameras.items():
             logger.info(f"Adding camera: {cam_name} ({cam_cfg.camera_type})")
 
-            # OAK-D in sender mode uses H.264 VPU encoding (no NVENC needed).
-            output_format = "h264" if cam_cfg.camera_type == "oakd" else "raw"
+            # Mono OAK-D uses on-device VPU H.264 encoding (no NVENC needed).
+            # Stereo OAK-D uses raw frames + host NVENC (VPU can't sustain
+            # dual H.264 at full framerate).
+            if cam_cfg.camera_type == "oakd" and not cam_cfg.stereo:
+                output_format = "h264"
+            else:
+                output_format = "raw"
 
             source_result = create_camera_source(
                 self,

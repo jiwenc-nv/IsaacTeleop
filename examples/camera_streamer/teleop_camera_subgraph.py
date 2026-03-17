@@ -13,20 +13,22 @@ This subgraph can be embedded in other applications that need camera visualizati
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
+from camera_config import CameraConfig, validate_camera_configs
 from holoscan.core import Fragment, Subgraph
 from holoscan.operators import HolovizOp
 from holoscan.resources import UnboundedAllocator
 from loguru import logger
-
 from nv_stream_decoder import NvStreamDecoderOp
 from operators.gstreamer_h264_receiver.gstreamer_h264_receiver_op import (
     GStreamerH264ReceiverOp,
 )
-from operators.video_stream_monitor.video_stream_monitor_op import VideoStreamMonitorOp
-from camera_config import CameraConfig, validate_camera_configs
-
+from operators.video_stream_monitor.video_stream_monitor_op import (
+    FrameCombinerOp,
+    VideoStreamMonitorOp,
+    create_no_signal_frame,
+)
 
 # -----------------------------------------------------------------------------
 # Receiver/Display Configuration
@@ -63,18 +65,21 @@ class MonitorConfig:
     title: str
     """Window title."""
 
-    padding: int
-    """Padding between camera tiles in pixels."""
-
     stream_timeout: float
     """Seconds before showing 'no signal' placeholder."""
+
+    padding: int = 0
+    """Padding between camera tiles in pixels."""
+
+    show_stereo: bool = False
+    """Show both left and right eyes for stereo cameras (side by side)."""
 
 
 @dataclass
 class XrConfig:
     """XR mode display configuration."""
 
-    planes: Dict[str, XrPlaneConfig]
+    planes: dict[str, XrPlaneConfig]
     """Per-camera plane configurations (keyed by camera name)."""
 
     lock_mode: str
@@ -119,7 +124,7 @@ class TeleopCameraSubgraphConfig:
     cuda_device: int
     """CUDA device for NVDEC decoding."""
 
-    cameras: Dict[str, CameraConfig]
+    cameras: dict[str, CameraConfig]
     """Camera configurations keyed by camera name."""
 
     monitor: MonitorConfig
@@ -128,7 +133,7 @@ class TeleopCameraSubgraphConfig:
     xr: XrConfig
     """XR mode display settings."""
 
-    def validate(self) -> List[str]:
+    def validate(self) -> list[str]:
         """Validate configuration and return list of errors.
 
         Returns:
@@ -152,24 +157,39 @@ class TeleopCameraSubgraphConfig:
 
             if cam_cfg.width <= 0 or cam_cfg.height <= 0:
                 errors.append(
-                    f"Camera '{cam_name}': invalid dimensions "
-                    f"{cam_cfg.width}x{cam_cfg.height}"
+                    f"Camera '{cam_name}': invalid dimensions {cam_cfg.width}x{cam_cfg.height}"
                 )
             if cam_cfg.fps <= 0:
                 errors.append(
                     f"Camera '{cam_name}': fps must be positive (got {cam_cfg.fps})"
                 )
 
+        if self.monitor.padding < 0:
+            errors.append(
+                f"Monitor padding must be non-negative (got {self.monitor.padding})"
+            )
+        elif self.monitor.padding > 0:
+            num_tiles = sum(
+                2 if (c.stereo and self.monitor.show_stereo) else 1
+                for c in self.cameras.values()
+            )
+            if (
+                num_tiles > 1
+                and (num_tiles - 1) * self.monitor.padding >= self.monitor.width
+            ):
+                errors.append(
+                    f"Monitor padding too large: ({num_tiles - 1}) * {self.monitor.padding} "
+                    f">= window width {self.monitor.width}"
+                )
+
         if self.display_mode == DisplayMode.XR:
             if self.xr.lock_mode not in ("lazy", "world", "head"):
                 errors.append(
-                    f"Invalid XR lock_mode '{self.xr.lock_mode}' "
-                    f"(must be 'lazy', 'world', or 'head')"
+                    f"Invalid XR lock_mode '{self.xr.lock_mode}' (must be 'lazy', 'world', or 'head')"
                 )
             if self.xr.reposition_distance < 0:
                 errors.append(
-                    f"XR reposition_distance must be >= 0 "
-                    f"(got {self.xr.reposition_distance})"
+                    f"XR reposition_distance must be >= 0 (got {self.xr.reposition_distance})"
                 )
 
         return errors
@@ -199,7 +219,7 @@ class TeleopCameraSubgraphConfig:
         """
         import yaml
 
-        with open(yaml_path, "r") as f:
+        with open(yaml_path) as f:
             data = yaml.safe_load(f)
 
         # Parse cameras
@@ -215,8 +235,9 @@ class TeleopCameraSubgraphConfig:
             width=mon["width"],
             height=mon["height"],
             title=mon["title"],
-            padding=mon["padding"],
+            padding=mon.get("padding", 0),
             stream_timeout=mon["stream_timeout"],
+            show_stereo=mon.get("show_stereo", False),
         )
 
         xr = display["xr"]
@@ -273,7 +294,7 @@ class TeleopCameraSubgraph(Subgraph):
         fragment: Fragment,
         name: str,
         config: TeleopCameraSubgraphConfig,
-        xr_session: Optional[Any] = None,
+        xr_session: Any | None = None,
     ):
         """
         Initialize the teleop camera subgraph.
@@ -290,7 +311,7 @@ class TeleopCameraSubgraph(Subgraph):
         self._config = config
         self._xr_session = xr_session
         self._name_prefix = name
-        self._camera_output_names: List[str] = []
+        self._camera_output_names: list[str] = []
 
         # Validate configuration
         config.validate_or_raise()
@@ -302,7 +323,7 @@ class TeleopCameraSubgraph(Subgraph):
         super().__init__(fragment, name)
 
     @property
-    def camera_output_names(self) -> List[str]:
+    def camera_output_names(self) -> list[str]:
         """Names of the camera output interface ports.
 
         Each name can be used in ``add_flow(subgraph, downstream, {(name, ...)})``
@@ -330,11 +351,11 @@ class TeleopCameraSubgraph(Subgraph):
         )
 
         # Track all monitored frame outputs (after VideoStreamMonitorOp)
-        monitored_outputs: Dict[str, Any] = {}
+        monitored_outputs: dict[str, Any] = {}
         # Tensor name each source produces (for HolovizOp matching).
         # Sources going through VideoStreamMonitorOp get renamed to cam_name;
         # sources that skip the monitor keep their native name.
-        tensor_names: Dict[str, str] = {}
+        tensor_names: dict[str, str] = {}
 
         if self._config.source == "local":
             self._compose_local_sources(
@@ -402,14 +423,19 @@ class TeleopCameraSubgraph(Subgraph):
                     monitored_outputs[display_key] = (src_op, src_port)
                     # V4L2's FormatConverterOp already names tensors;
                     # video_file replayer outputs unnamed ("") tensors.
+                    # Multiple video_file sources would share the "" key in
+                    # FrameCombinerOp, but this is a single-replayer test path.
                     tensor_names[display_key] = (
                         cam_name if cam_cfg.camera_type == "v4l2" else ""
                     )
                 else:
                     if self._config.display_mode == DisplayMode.MONITOR:
-                        tensor_name = (
-                            cam_name if stream_name in ("left", "mono") else ""
-                        )
+                        if cam_cfg.stereo and self._config.monitor.show_stereo:
+                            tensor_name = f"{cam_name}_{stream_name}"
+                        else:
+                            tensor_name = (
+                                cam_name if stream_name in ("left", "mono") else ""
+                            )
                     else:
                         tensor_name = ""
 
@@ -468,7 +494,12 @@ class TeleopCameraSubgraph(Subgraph):
                 )
 
                 if self._config.display_mode == DisplayMode.MONITOR:
-                    tensor_name = cam_name if stream_name in ("left", "mono") else ""
+                    if cam_cfg.stereo and self._config.monitor.show_stereo:
+                        tensor_name = f"{cam_name}_{stream_name}"
+                    else:
+                        tensor_name = (
+                            cam_name if stream_name in ("left", "mono") else ""
+                        )
                 else:
                     tensor_name = ""
 
@@ -498,19 +529,28 @@ class TeleopCameraSubgraph(Subgraph):
 
     def _compose_monitor_mode(
         self,
-        monitored_outputs: Dict[str, Any],
-        tensor_names: Dict[str, str],
+        monitored_outputs: dict[str, Any],
+        tensor_names: dict[str, str],
         allocator,
     ):
         """Compose monitor mode pipeline using HolovizOp native tiling."""
         mon_cfg = self._config.monitor
 
-        # Build list of cameras to display (for stereo, only left eye)
+        # Build list of streams to display.
         # Each entry is (display_name, monitor_key, cam_cfg)
-        camera_list: List[Tuple[str, str, CameraConfig]] = []
+        # With show_stereo, stereo cameras get two entries (left + right).
+        camera_list: list[tuple[str, str, CameraConfig]] = []
         for cam_name, cam_cfg in self._config.cameras.items():
             if cam_cfg.stereo:
-                camera_list.append((cam_name, f"{cam_name}_left", cam_cfg))
+                if mon_cfg.show_stereo:
+                    camera_list.append(
+                        (f"{cam_name}_left", f"{cam_name}_left", cam_cfg)
+                    )
+                    camera_list.append(
+                        (f"{cam_name}_right", f"{cam_name}_right", cam_cfg)
+                    )
+                else:
+                    camera_list.append((cam_name, f"{cam_name}_left", cam_cfg))
             else:
                 camera_list.append((cam_name, cam_name, cam_cfg))
 
@@ -568,19 +608,36 @@ class TeleopCameraSubgraph(Subgraph):
             tensors=tensors,
         )
 
-        for _, monitor_key, _ in camera_list:
+        combiner_placeholders = {}
+        for display_name, monitor_key, cam_cfg in camera_list:
+            if monitor_key in monitored_outputs:
+                tensor_key = tensor_names.get(monitor_key, display_name)
+                placeholder = create_no_signal_frame(
+                    cam_cfg.width, cam_cfg.height, display_name
+                )
+                combiner_placeholders[tensor_key] = placeholder
+
+        combiner = FrameCombinerOp(
+            self.fragment,
+            name=self._create_name("frame_combiner"),
+            placeholders=combiner_placeholders,
+        )
+
+        for display_name, monitor_key, _ in camera_list:
             if monitor_key in monitored_outputs:
                 monitor, port = monitored_outputs[monitor_key]
-                self.add_flow(monitor, visualizer, {(port, "receivers")})
+                self.add_flow(monitor, combiner, {(port, "in")})
 
+        self.add_flow(combiner, visualizer, {("out", "receivers")})
+
+        self.add_operator(combiner)
         self.add_operator(visualizer)
 
         logger.info(
-            f"Monitor mode: {num_cameras} cameras tiled, "
-            f"{mon_cfg.width}x{mon_cfg.height}"
+            f"Monitor mode: {num_cameras} cameras tiled, {mon_cfg.width}x{mon_cfg.height}"
         )
 
-    def _compose_xr_mode(self, monitored_outputs: Dict[str, Any]):
+    def _compose_xr_mode(self, monitored_outputs: dict[str, Any]):
         """Compose XR mode pipeline with 3D plane rendering using XrPlaneRendererOp.
 
         Uses a single XrPlaneRendererOp to render all planes with one Vulkan context.
@@ -592,8 +649,10 @@ class TeleopCameraSubgraph(Subgraph):
         try:
             import holohub.xr as xr
             from xr_plane_renderer import (
-                XrPlaneRendererOp,
                 XrPlaneConfig as CppXrPlaneConfig,
+            )
+            from xr_plane_renderer import (
+                XrPlaneRendererOp,
             )
         except ImportError:
             logger.error("XR mode requires holohub.xr and xr_plane_renderer modules")
@@ -615,18 +674,16 @@ class TeleopCameraSubgraph(Subgraph):
 
         # Build plane configurations for XrPlaneRendererOp
         # Order: cameras in config order, will be sorted by distance in operator
-        plane_configs: List[CppXrPlaneConfig] = []
+        plane_configs: list[CppXrPlaneConfig] = []
 
-        # Track input connections: plane_index -> source
-        # (No stereo support for now - just use left camera)
-        plane_inputs: List[Optional[Any]] = []
+        # Track input connections: plane_index -> (left_source, right_source_or_None)
+        plane_inputs: list[tuple[Any | None, Any | None]] = []
 
         for cam_name, cam_cfg in self._config.cameras.items():
             plane_cfg = xr_cfg.planes.get(cam_name)
             if plane_cfg is None:
                 raise ValueError(f"Camera '{cam_name}' not configured in xr.planes")
 
-            # Create C++ XrPlaneConfig with all settings
             cpp_config = CppXrPlaneConfig(
                 name=cam_name,
                 distance=plane_cfg.distance,
@@ -638,15 +695,24 @@ class TeleopCameraSubgraph(Subgraph):
                 reposition_distance=xr_cfg.reposition_distance,
                 reposition_delay=xr_cfg.reposition_delay,
                 transition_duration=xr_cfg.transition_duration,
-                is_stereo=False,  # No stereo support for now
+                is_stereo=cam_cfg.stereo,
             )
             plane_configs.append(cpp_config)
 
-            # Use left camera for stereo, or mono camera
             if cam_cfg.stereo:
-                plane_inputs.append(monitored_outputs.get(f"{cam_name}_left"))
+                plane_inputs.append(
+                    (
+                        monitored_outputs.get(f"{cam_name}_left"),
+                        monitored_outputs.get(f"{cam_name}_right"),
+                    )
+                )
             else:
-                plane_inputs.append(monitored_outputs.get(cam_name))
+                plane_inputs.append(
+                    (
+                        monitored_outputs.get(cam_name),
+                        None,
+                    )
+                )
 
         if not plane_configs:
             logger.warning("No cameras configured for XR mode")
@@ -662,10 +728,15 @@ class TeleopCameraSubgraph(Subgraph):
         )
 
         # Connect camera inputs to XrPlaneRendererOp
-        for i, src in enumerate(plane_inputs):
-            if src:
-                src_op, src_port = src
+        for i, (left_src, right_src) in enumerate(plane_inputs):
+            if left_src:
+                src_op, src_port = left_src
                 self.add_flow(src_op, xr_renderer, {(src_port, f"camera_frame_{i}")})
+            if right_src:
+                src_op, src_port = right_src
+                self.add_flow(
+                    src_op, xr_renderer, {(src_port, f"camera_frame_{i}_right")}
+                )
 
         # Connect XR frame timing loop
         self.fragment.add_flow(self.fragment.start_op(), xr_begin)  # Bootstrap
