@@ -226,6 +226,8 @@ jobs:
     needs:
       - build-ubuntu
       - test-cloudxr
+    outputs:
+      wheel_paths: ${{ steps.upload-artifactory.outputs.wheel_paths }}
     environment: dev
     # Publish only after build and CloudXR tests succeed.
     if: ${{ needs.build-ubuntu.result == 'success' && needs.test-cloudxr.result == 'success' }}
@@ -236,6 +238,10 @@ jobs:
       with:
         python-version: '3.11'
 
+    - name: Ensure clean wheels directory
+      run: |
+        rm -rf wheels
+
     - name: Download wheel artifacts
       uses: actions/download-artifact@v7
       with:
@@ -244,6 +250,7 @@ jobs:
         path: wheels
 
     - name: Upload wheel(s) to Artifactory
+      id: upload-artifactory
       env:
         ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
         ARTIFACTORY_REPO: ${{ secrets.ARTIFACTORY_REPO }}
@@ -283,88 +290,72 @@ jobs:
           -p "${ARTIFACTORY_API_KEY}" \
           "${wheels[@]}"
 
-  publish-github-release-assets:
-    runs-on: ubuntu-latest
-    needs:
-      - build-ubuntu
-      - test-cloudxr
-    outputs:
-      wheel_urls: ${{ steps.upload-release-assets.outputs.wheel_urls }}
-      release_tag: ${{ steps.upload-release-assets.outputs.release_tag }}
-    permissions:
-      contents: write
-    # Publish on every push after build and CloudXR tests succeed.
-    if: ${{ github.event_name == 'push' && needs.build-ubuntu.result == 'success' && needs.test-cloudxr.result == 'success' }}
+        wheel_base="${ARTIFACTORY_URL%/}/${ARTIFACTORY_REPO}"
+        wheel_prefix="${wheel_base}/"
 
-    steps:
-    - name: Download wheel artifacts
-      uses: actions/download-artifact@v7
-      with:
-        pattern: isaacteleop-wheels-*
-        merge-multiple: true
-        path: wheels
+        wheel_paths=()
+        for wheel in "${wheels[@]}"; do
+          wheel_name="$(basename "${wheel}")"
+          echo "Resolving Artifactory URL for ${wheel_name}"
 
-    - name: Upload wheel(s) as GitHub release assets
-      id: upload-release-assets
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        GH_REPO: ${{ github.repository }}
-      run: |
-        set -euo pipefail
+          search_json="$(curl --fail-with-body --show-error --silent --location --get --connect-timeout 10 --max-time 60 \
+            -u "${ARTIFACTORY_USERNAME}:${ARTIFACTORY_API_KEY}" \
+            --data-urlencode "name=${wheel_name}" \
+            --data-urlencode "repos=${ARTIFACTORY_REPO}" \
+            "${ARTIFACTORY_URL%/}/api/search/artifact")"
 
-        shopt -s nullglob
-        wheels=(wheels/*.whl)
-        if (( ${#wheels[@]} == 0 )); then
-          echo "No wheels found under wheels/*.whl"
-          ls -la wheels || true
-          exit 1
-        fi
+          result_count="$(jq '.results | length' <<< "${search_json}")"
+          if [[ "${result_count}" -ne 1 ]]; then
+            echo "Expected exactly 1 Artifactory search result for ${wheel_name}, but got ${result_count}"
+            echo "${search_json}"
+            exit 1
+          fi
 
-        tag="ci-wheels-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-        title="CI Wheels ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          storage_uri="$(jq -r '.results[0].uri // empty' <<< "${search_json}")"
+          if [[ -z "${storage_uri}" ]]; then
+            echo "Unable to resolve storage URI for ${wheel_name}"
+            echo "${search_json}"
+            exit 1
+          fi
 
-        gh release create "${tag}" \
-          --repo "${GH_REPO}" \
-          --target "${GITHUB_SHA}" \
-          --title "${title}" \
-          --notes "Automated wheel artifacts for ${GITHUB_SHA}" \
-          --draft
+          metadata_json="$(curl --fail-with-body --show-error --silent --location --connect-timeout 10 --max-time 60 \
+            -u "${ARTIFACTORY_USERNAME}:${ARTIFACTORY_API_KEY}" \
+            "${storage_uri}")"
 
-        # Persist tag output immediately so cleanup can still run even if later steps fail.
-        echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+          download_uri="$(jq -r '.downloadUri // empty' <<< "${metadata_json}")"
+          if [[ -z "${download_uri}" ]]; then
+            echo "Unable to resolve downloadUri for ${wheel_name}"
+            echo "${metadata_json}"
+            exit 1
+          fi
 
-        echo "Uploading ${#wheels[@]} wheel(s) to release ${tag}"
-        gh release upload "${tag}" "${wheels[@]}" --repo "${GH_REPO}"
+          wheel_path="${download_uri#${wheel_prefix}}"
+          if [[ "${wheel_path}" == "${download_uri}" || -z "${wheel_path}" ]]; then
+            echo "Unable to clip Artifactory prefix from downloadUri for ${wheel_name}"
+            echo "Expected prefix: ${wheel_prefix}"
+            echo "${metadata_json}"
+            exit 1
+          fi
 
-        echo "Finalizing release ${tag} as pre-release"
-        gh release edit "${tag}" --repo "${GH_REPO}" --draft=false --prerelease
-
-        echo "Uploaded assets on ${tag}:"
-        release_assets_json="$(gh release view "${tag}" --repo "${GH_REPO}" --json assets)"
-        echo "${release_assets_json}"
-
-        wheel_urls="$(jq -r '.assets[] | select(.name | endswith(".whl")) | .url' <<< "${release_assets_json}")"
-        if [[ -z "${wheel_urls}" ]]; then
-          echo "Unable to find wheel asset URLs in uploaded release assets"
-          exit 1
-        fi
+          wheel_paths+=("${wheel_path}")
+        done
 
         {
-          echo "wheel_urls<<EOF"
-          echo "${wheel_urls}"
+          echo "wheel_paths<<EOF"
+          printf '%s\n' "${wheel_paths[@]}"
           echo "EOF"
         } >> "$GITHUB_OUTPUT"
 
   kitmaker:
     runs-on: [self-hosted, linux]
     needs:
-      - publish-github-release-assets
+      - publish-wheel
     outputs:
       release_uuid: ${{ steps.submit-kitmaker.outputs.release_uuid }}
     environment: release
     permissions:
       contents: read
-    if: ${{ needs.publish-github-release-assets.result == 'success' }}
+    if: ${{ github.event_name != 'pull_request' && needs.publish-wheel.result == 'success' }}
 
     steps:
     - name: Submit wheel release to Kitmaker
@@ -374,13 +365,15 @@ jobs:
         KITMAKER_PROJECT_ID: ${{ secrets.KITMAKER_PROJECT_ID }}
         KITMAKER_TOKEN: ${{ secrets.KITMAKER_TOKEN }}
         KITMAKER_PIC_EMAIL: ${{ secrets.KITMAKER_PIC_EMAIL }}
-        WHEEL_URLS: ${{ needs.publish-github-release-assets.outputs.wheel_urls }}
+        ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+        ARTIFACTORY_REPO: ${{ secrets.ARTIFACTORY_REPO }}
+        WHEEL_PATHS: ${{ needs.publish-wheel.outputs.wheel_paths }}
         KITMAKER_UPLOAD: ${{ startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/tags/v') }}
       run: |
         set -euo pipefail
 
-        if [[ -z "${KITMAKER_API_ENDPOINT}" || -z "${KITMAKER_PROJECT_ID}" || -z "${KITMAKER_TOKEN}" || -z "${KITMAKER_PIC_EMAIL}" ]]; then
-          echo "Missing one or more required secrets: KITMAKER_API_ENDPOINT, KITMAKER_PROJECT_ID, KITMAKER_TOKEN, KITMAKER_PIC_EMAIL"
+        if [[ -z "${KITMAKER_API_ENDPOINT}" || -z "${KITMAKER_PROJECT_ID}" || -z "${KITMAKER_TOKEN}" || -z "${KITMAKER_PIC_EMAIL}" || -z "${ARTIFACTORY_URL}" || -z "${ARTIFACTORY_REPO}" ]]; then
+          echo "Missing one or more required secrets: KITMAKER_API_ENDPOINT, KITMAKER_PROJECT_ID, KITMAKER_TOKEN, KITMAKER_PIC_EMAIL, ARTIFACTORY_URL, ARTIFACTORY_REPO"
           exit 1
         fi
 
@@ -389,16 +382,24 @@ jobs:
           exit 1
         fi
 
-        if [[ -z "${WHEEL_URLS}" ]]; then
-          echo "No wheel URLs were produced by publish-github-release-assets job"
+        if [[ "${ARTIFACTORY_URL}" != https://* ]]; then
+          echo "ARTIFACTORY_URL must use https://"
           exit 1
         fi
 
+        if [[ -z "${WHEEL_PATHS}" ]]; then
+          echo "No wheel paths were produced by publish-wheel job"
+          exit 1
+        fi
+
+        wheel_base="${ARTIFACTORY_URL%/}/${ARTIFACTORY_REPO}"
+
         api_url="${KITMAKER_API_ENDPOINT%/}/v0/projects/${KITMAKER_PROJECT_ID}/releases"
         payload_items=()
-        while IFS= read -r wheel_url; do
-          [[ -z "${wheel_url}" ]] && continue
-          wheel_name="$(basename "${wheel_url}")"
+        while IFS= read -r wheel_path; do
+          [[ -z "${wheel_path}" ]] && continue
+          wheel_url="${wheel_base}/${wheel_path}"
+          wheel_name="$(basename "${wheel_path}")"
           echo "Queueing wheel for Kitmaker payload: ${wheel_name}"
 
           payload_items+=("$(jq -cn \
@@ -406,7 +407,7 @@ jobs:
             --arg url "${wheel_url}" \
             --argjson upload "${KITMAKER_UPLOAD}" \
             '{pic: $pic, job_type: "wheel-release-job", publish_to: "both_devzone_pypi", url: $url, size: "small", upload: $upload}')")
-        done <<< "${WHEEL_URLS}"
+          done <<< "${WHEEL_PATHS}"
 
         if (( ${#payload_items[@]} == 0 )); then
           echo "No valid wheel URLs found to submit to Kitmaker"
@@ -439,16 +440,28 @@ jobs:
     environment: release
     permissions:
       contents: read
-    if: ${{ needs.kitmaker.result == 'success' }}
+    if: ${{ github.event_name != 'pull_request' && needs.kitmaker.result == 'success' }}
 
     steps:
     - name: Monitor Kitmaker release status
       env:
         KITMAKER_API_ENDPOINT: ${{ secrets.KITMAKER_API_ENDPOINT }}
+        KITMAKER_PROJECT_ID: ${{ secrets.KITMAKER_PROJECT_ID }}
         KITMAKER_TOKEN: ${{ secrets.KITMAKER_TOKEN }}
         KITMAKER_RELEASE_UUID: ${{ needs.kitmaker.outputs.release_uuid }}
+        ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+        ARTIFACTORY_REPO: ${{ secrets.ARTIFACTORY_REPO }}
       run: |
         set -euo pipefail
+
+        # Redact sensitive values that may appear in API responses.
+        echo "::add-mask::${KITMAKER_API_ENDPOINT}"
+        echo "::add-mask::${KITMAKER_API_ENDPOINT%/}"
+        echo "::add-mask::${KITMAKER_RELEASE_UUID}"
+        echo "::add-mask::${KITMAKER_PROJECT_ID}"
+        echo "::add-mask::${ARTIFACTORY_URL}"
+        echo "::add-mask::${ARTIFACTORY_URL%/}"
+        echo "::add-mask::${ARTIFACTORY_REPO}"
 
         if [[ -z "${KITMAKER_API_ENDPOINT}" || -z "${KITMAKER_TOKEN}" ]]; then
           echo "Missing required secrets: KITMAKER_API_ENDPOINT, KITMAKER_TOKEN"
@@ -500,29 +513,3 @@ jobs:
 
         echo "Timed out waiting for Kitmaker release ${KITMAKER_RELEASE_UUID} to complete"
         exit 1
-
-  cleanup-github-release-assets:
-    runs-on: ubuntu-latest
-    needs:
-      - publish-github-release-assets
-      - kitmaker-status
-    permissions:
-      contents: write
-    if: ${{ always() && needs.publish-github-release-assets.result == 'success' }}
-
-    steps:
-    - name: Delete GitHub release and tag
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        GH_REPO: ${{ github.repository }}
-        RELEASE_TAG: ${{ needs.publish-github-release-assets.outputs.release_tag }}
-      run: |
-        set -euo pipefail
-
-        if [[ -z "${RELEASE_TAG}" ]]; then
-          echo "No release tag was produced by publish-github-release-assets job"
-          exit 1
-        fi
-
-        echo "Deleting GitHub release and tag: ${RELEASE_TAG}"
-        gh release delete "${RELEASE_TAG}" --repo "${GH_REPO}" --cleanup-tag --yes
