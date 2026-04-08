@@ -12,6 +12,10 @@ examples. The instructions align with the project's CMake configuration and the 
    :local:
    :depth: 1
 
+.. admonition:: Next Steps
+
+   - To build and serve the **WebXR client** locally, see :doc:`webxr`.
+
 Prerequisites
 -------------
 
@@ -268,6 +272,11 @@ based on the Python version.  Note that ``pip`` and ``uv pip`` has slightly diff
 
    # Pass --reinstall to replace an existing install.
    uv pip install isaacteleop[retargeters,cloudxr,ui] --find-links=./install/wheels/ --reinstall
+
+.. toctree::
+   :hidden:
+
+   webxr
 
 ..
    References
