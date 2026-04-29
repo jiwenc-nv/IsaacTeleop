@@ -1,34 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build docs and Teleop web app, then deploy to *this repo's* gh-pages branch.
-# The deploy target is always the running repository, so the workflow behaves
-# the same on forks as on canonical — each pushes to its own GitHub Pages site.
+# Build docs and Teleop web app, then deploy to GitHub Pages.
+# - Push to main/release (canonical repo): deploy docs at site root, web app at /client/.
+# - Pull request from a same-repo branch: auto-deploy preview to preview/pr-<N>/.
+# - Pull request from a fork: build only (skip deploy). A maintainer can deploy
+#   the preview manually via the `/preview` slash command — see
+#   docs-preview-on-comment.yaml.
 #
-# - Push to main/release on NVIDIA/IsaacTeleop: deploy multi-version docs at
-#   site root, web app at /client/.
-# - Push to any other branch (canonical or fork) with an open PR against
-#   NVIDIA/IsaacTeleop: deploy single-version preview to preview/pr-<N>/, web
-#   app at preview/pr-<N>/client/. Pushes without an open PR skip the preview
-#   (re-run via "Run workflow" after opening the PR, or push another commit).
-#
-# Fork setup (one-time, per fork):
-#   1. Enable Actions: Settings → Actions → General → Allow all actions.
-#   2. Push a branch with docs changes once. The workflow creates `gh-pages`.
-#   3. Enable Pages: Settings → Pages → Source = `gh-pages` branch, root.
-#   4. (Optional) For the private CloudXR Web SDK, add a repo secret named
-#      NGC_TELEOP_CORE_GITHUB_SERVICE_KEY. Without it the public SDK is used.
+# PR: docs always built; web client (npm) built with public SDK for all, or private SDK only for allowlisted authors.
+# Main/release (push): key used → private NGC for SDK.
+# Allowlist for CXR.js SDK on PRs: Repo Settings → Variables → ALLOWED_CLOUDXR_JS_PR_AUTHORS (comma-separated GitHub logins).
 
 name: Build & deploy docs
 
 on:
   push:
+    branches:
+      - main
+      - 'release/**'
+  pull_request:
+    types: [opened, synchronize, reopened]
     paths:
       - "docs/**"
       - ".github/workflows/docs.yaml"
       - "deps/cloudxr/webxr_client/**"
       - "deps/cloudxr/.env.default"
-  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -40,35 +37,32 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     outputs:
+      is-canonical-repo: ${{ steps.is-canonical-repo.outputs.defined }}
       is-deploy-branch: ${{ steps.is-deploy-branch.outputs.defined }}
-      pr-number: ${{ steps.find-pr.outputs.number }}
+      use_ngc_key: ${{ steps.ngc-allowlist.outputs.use_ngc_key }}
     steps:
-      - id: is-deploy-branch
-        if: >-
-          github.repository == 'NVIDIA/IsaacTeleop'
-          && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
-        run: echo "defined=true" >> "$GITHUB_OUTPUT"
-
-      # Look up the open PR for this branch against NVIDIA/IsaacTeleop. Empty
-      # output means no PR yet → preview is skipped downstream.
-      - id: find-pr
-        if: steps.is-deploy-branch.outputs.defined != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ "${{ github.event.repository.fork }}" = 'true' ]; then
-            HEAD="${{ github.repository_owner }}:${{ github.ref_name }}"
-          else
-            HEAD="${{ github.ref_name }}"
-          fi
-          NUM=$(gh pr list --repo NVIDIA/IsaacTeleop --head "$HEAD" \
-                  --state open --json number --jq '.[0].number // empty')
-          echo "number=$NUM" >> "$GITHUB_OUTPUT"
-          if [ -n "$NUM" ]; then
-            echo "Found PR #$NUM for head=\`$HEAD\`" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "No open PR for head=\`$HEAD\` — preview will be skipped." >> "$GITHUB_STEP_SUMMARY"
-          fi
+    - id: is-canonical-repo
+      if: github.repository == 'NVIDIA/IsaacTeleop'
+      run: echo "defined=true" >> "$GITHUB_OUTPUT"
+    - id: is-deploy-branch
+      if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+      run: echo "defined=true" >> "$GITHUB_OUTPUT"
+    - id: ngc-allowlist
+      run: |
+        if [ "${{ github.event_name }}" != 'pull_request' ]; then
+          echo "use_ngc_key=true" >> "$GITHUB_OUTPUT"
+        elif [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+          echo "use_ngc_key=false" >> "$GITHUB_OUTPUT"
+        else
+          ACTOR="${{ github.actor }}"
+          ALLOWED="${{ vars.ALLOWED_CLOUDXR_JS_PR_AUTHORS }}"
+          # Normalize: remove spaces so "alice, bob" matches like "alice,bob"
+          ALLOWED="${ALLOWED// /}"
+          case ",${ALLOWED}," in
+            *",${ACTOR},"*) echo "use_ngc_key=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "use_ngc_key=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+        fi
 
   build-docs:
     name: Build Docs
@@ -93,7 +87,7 @@ jobs:
 
       - name: Generate multi-version docs
         working-directory: ./docs
-        if: needs.check-repo.outputs.is-deploy-branch == 'true'
+        if: needs.check-repo.outputs.is-canonical-repo == 'true' && needs.check-repo.outputs.is-deploy-branch == 'true'
         run: |
           git fetch --prune --unshallow --tags
           make multi-docs
@@ -107,6 +101,7 @@ jobs:
   build-app:
     name: Build Teleop Web App
     runs-on: ubuntu-latest
+    needs: [check-repo]
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -117,11 +112,10 @@ jobs:
           version=$(grep -E '^CXR_WEB_SDK_VERSION=.+' deps/cloudxr/.env.default | cut -d= -f2)
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      # Use the private SDK if the running repo has the NGC key set; otherwise
-      # fall back to the public SDK (forks without the secret).
+      # Allowlist no → public only. Allowlist yes + NGC_API_KEY → private only.
       - name: Download CloudXR Web SDK from NGC
         env:
-          NGC_API_KEY: ${{ secrets.NGC_TELEOP_CORE_GITHUB_SERVICE_KEY }}
+          NGC_API_KEY: ${{ needs.check-repo.outputs.use_ngc_key == 'true' && secrets.NGC_TELEOP_CORE_GITHUB_SERVICE_KEY || '' }}
           SDK_VERSION: ${{ steps.sdk_version.outputs.version }}
         run: |
           SDK_FILE="nvidia-cloudxr-${SDK_VERSION}.tgz"
@@ -160,6 +154,7 @@ jobs:
     name: Deploy docs
     runs-on: ubuntu-latest
     needs: [check-repo, build-docs, build-app]
+    if: needs.check-repo.outputs.is-canonical-repo == 'true' && (needs.check-repo.outputs.is-deploy-branch == 'true' || github.event_name == 'pull_request')
     permissions:
       contents: write  # push to gh-pages
     steps:
@@ -177,45 +172,66 @@ jobs:
 
       - name: Place web app under subpath
         run: |
-          if [ "${{ needs.check-repo.outputs.is-deploy-branch }}" = 'true' ]; then
-            CLIENT_DIR=./docs/build/client
-          else
+          if [ "${{ github.event_name }}" = 'pull_request' ]; then
             CLIENT_DIR=./docs/build/current/client
+          else
+            CLIENT_DIR=./docs/build/client
           fi
           mkdir -p "$CLIENT_DIR"
           cp -r ./webapp/. "$CLIENT_DIR/"
 
-      - name: Deploy to gh-pages root (canonical main/release)
-        if: needs.check-repo.outputs.is-deploy-branch == 'true'
+      - name: Deploy to gh-pages (main branch)
+        if: github.event_name == 'push' && needs.check-repo.outputs.is-deploy-branch == 'true'
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs/build
           keep_files: true
 
+      # Fork PRs have a read-only GITHUB_TOKEN and can't push to gh-pages, so
+      # the auto-deploy is gated to same-repo PRs. Fork PR previews are
+      # handled by docs-preview-on-comment.yaml (slash-command triggered).
       - name: Deploy PR preview to gh-pages
-        if: needs.check-repo.outputs.is-deploy-branch != 'true' && needs.check-repo.outputs.pr-number != ''
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs/build/current
-          destination_dir: preview/pr-${{ needs.check-repo.outputs.pr-number }}
+          destination_dir: preview/pr-${{ github.event.pull_request.number }}
           keep_files: true
 
       - name: Add preview URL to workflow summary
-        if: needs.check-repo.outputs.is-deploy-branch != 'true' && needs.check-repo.outputs.pr-number != ''
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
         run: |
-          base="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/preview/pr-${{ needs.check-repo.outputs.pr-number }}/"
+          base="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/"
           client_url="${base}client/"
           {
             echo "## Docs preview"
             echo
-            echo "Preview for PR #${{ needs.check-repo.outputs.pr-number }}:"
+            echo "Built docs for this PR are available at:"
             echo
             echo "**${base}**"
             echo
             echo "Teleop web app (subpath \`/client/\`): **${client_url}**"
             echo
-            echo "(It may take a minute to appear after the workflow completes."
-            echo " On a fork, GitHub Pages must be enabled with source = gh-pages.)"
+            echo "(It may take a minute to appear after the workflow completes.)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Note manual-trigger requirement for fork PRs
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          {
+            echo "## Docs preview"
+            echo
+            echo "This PR is from a fork, so the preview is **not auto-deployed**."
+            echo "A maintainer with write access can comment \`/preview\` on the PR"
+            echo "to deploy a preview to:"
+            echo
+            echo "**https://nvidia.github.io/IsaacTeleop/preview/pr-${{ github.event.pull_request.number }}/**"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -32,34 +32,44 @@ treated as errors — fix them locally before pushing.
 PR preview on GitHub Pages
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The ``Build & deploy docs`` workflow runs on every push that touches the
-documentation, looks up the open pull request on ``NVIDIA/IsaacTeleop`` for
-the pushed branch, and publishes a preview to **the running repository's**
-GitHub Pages site under ``preview/pr-<N>/``:
+Every PR preview is published to a single canonical location:
 
-- Pushing to a branch on ``NVIDIA/IsaacTeleop`` (canonical) publishes to:
+.. code-block:: text
 
-  .. code-block:: text
+   https://nvidia.github.io/IsaacTeleop/preview/pr-<N>/
 
-     https://nvidia.github.io/IsaacTeleop/preview/pr-<N>/
+How the preview gets built depends on where the PR's branch lives.
 
-- Pushing to a branch on your fork (e.g. ``<your-user>/IsaacTeleop``) publishes
-  to your fork's Pages site:
+PRs from a branch on ``NVIDIA/IsaacTeleop``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-  .. code-block:: text
+The ``Build & deploy docs`` workflow runs automatically on every push to the
+PR branch and publishes the preview. The preview URL is added to the workflow
+run's *Summary* tab and refreshed on every push. No extra action required.
 
-     https://<your-user>.github.io/IsaacTeleop/preview/pr-<N>/
+PRs from a fork
+^^^^^^^^^^^^^^^
 
-The preview link is also added to the workflow run's *Summary* tab and is
-refreshed on every push.
+GitHub Actions on PRs from forks run with a read-only token, so the workflow
+cannot push to ``gh-pages`` automatically. Instead:
 
-.. note::
+1. When a fork PR is opened, a bot comments with instructions.
+2. A maintainer (anyone with write access to ``NVIDIA/IsaacTeleop``) deploys
+   the preview by commenting on the PR:
 
-   PRs are looked up at deploy time, so the workflow needs the PR to already
-   exist when it runs. If you push **before** opening the PR, the run will
-   skip the preview and note "No open PR for head=…" in its summary. After
-   opening the PR, either push another commit or trigger the workflow
-   manually from the *Actions* tab (``Run workflow``).
+   .. code-block:: text
+
+      /preview
+
+3. The maintainer-triggered workflow checks out the PR's head, builds the
+   docs, deploys to ``preview/pr-<N>/``, and reacts to the comment with 👀
+   while building and 👍 once published. A follow-up comment posts the
+   preview URL.
+
+Re-running ``/preview`` after new commits land on the PR redeploys with the
+latest changes. Previews are not auto-cleaned; maintainers can run the
+``Cleanup docs PR previews`` workflow from the *Actions* tab to clear the
+``preview/`` tree.
 
 One-time setup for forks
 ~~~~~~~~~~~~~~~~~~~~~~~~
