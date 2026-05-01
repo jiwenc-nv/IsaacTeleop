@@ -210,6 +210,18 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
+    - name: Debug workspace state
+      run: |
+        echo "pwd: $(pwd)"
+        echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+        ls -la
+        echo "--- deps/ ---"
+        ls -la deps/ 2>&1 || true
+        echo "--- deps/cloudxr/ ---"
+        ls -la deps/cloudxr/ 2>&1 || true
+        echo "--- stat deps/cloudxr ---"
+        stat deps/cloudxr 2>&1 || true
+
     - name: Run Tests with CloudXR
       env:
         CI: true
