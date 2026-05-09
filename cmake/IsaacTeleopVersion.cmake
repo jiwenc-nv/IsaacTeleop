@@ -22,6 +22,21 @@ function(isaac_teleop_read_version version_file out_cmake_version_var out_pyproj
 	file(READ "${_isaac_teleop_version_file}" _isaac_teleop_version_base)
 	string(STRIP "${_isaac_teleop_version_base}" _isaac_teleop_version_base)
 
+	string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.x" _isaac_teleop_version_match "${_isaac_teleop_version_base}")
+	if(NOT _isaac_teleop_version_match)
+		message(FATAL_ERROR "Base version must be in MAJOR.MINOR.x format; actual content: '${_isaac_teleop_version_base}'")
+	endif()
+	set(_isaac_teleop_version_major "${CMAKE_MATCH_1}")
+	set(_isaac_teleop_version_minor "${CMAKE_MATCH_2}")
+
+	set(_isaac_teleop_is_ci FALSE)
+	if(DEFINED ENV{CI} AND NOT "$ENV{CI}" STREQUAL "")
+		string(TOLOWER "$ENV{CI}" _isaac_teleop_ci_value)
+		if(NOT _isaac_teleop_ci_value STREQUAL "0" AND NOT _isaac_teleop_ci_value STREQUAL "false")
+			set(_isaac_teleop_is_ci TRUE)
+		endif()
+	endif()
+
 	execute_process(
 		COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse --show-toplevel
 		OUTPUT_VARIABLE _isaac_teleop_git_root
@@ -30,7 +45,17 @@ function(isaac_teleop_read_version version_file out_cmake_version_var out_pyproj
 		RESULT_VARIABLE _isaac_teleop_git_root_result
 	)
 	if(NOT _isaac_teleop_git_root_result EQUAL 0 OR _isaac_teleop_git_root STREQUAL "")
-		message(FATAL_ERROR "Failed to determine git root. Ensure this is a git repository and git is available.")
+		if(_isaac_teleop_is_ci)
+			message(FATAL_ERROR "Failed to determine git root. Ensure this is a git repository and git is available.")
+		endif()
+		# Non-CI fallback: source tree is not inside a usable git checkout (e.g. only a
+		# subdirectory mounted into a container). Emit X.Y+local without consulting git.
+		set(_isaac_teleop_version "${_isaac_teleop_version_major}.${_isaac_teleop_version_minor}")
+		set(_isaac_teleop_pyproject_version "${_isaac_teleop_version_major}.${_isaac_teleop_version_minor}+local")
+		set(${out_cmake_version_var} "${_isaac_teleop_version}" PARENT_SCOPE)
+		set(${out_pyproject_version_var} "${_isaac_teleop_pyproject_version}" PARENT_SCOPE)
+		message(STATUS "IsaacTeleop version: ${_isaac_teleop_version} (${_isaac_teleop_version_base}, no git) python: ${_isaac_teleop_pyproject_version} kind: local")
+		return()
 	endif()
 	execute_process(
 		COMMAND "${GIT_EXECUTABLE}" -C "${_isaac_teleop_git_root}" rev-list -n 1 HEAD -- "${_isaac_teleop_version_file}"
@@ -87,22 +112,8 @@ function(isaac_teleop_read_version version_file out_cmake_version_var out_pyproj
 		set(_isaac_teleop_git_tag "")
 	endif()
 
-	string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.x" _isaac_teleop_version_match "${_isaac_teleop_version_base}")
-	if(NOT _isaac_teleop_version_match)
-		message(FATAL_ERROR "Base version must be in MAJOR.MINOR.x format; actual content: '${_isaac_teleop_version_base}'")
-	endif()
-	set(_isaac_teleop_version_major "${CMAKE_MATCH_1}")
-	set(_isaac_teleop_version_minor "${CMAKE_MATCH_2}")
 	set(_isaac_teleop_version_patch "${_isaac_teleop_git_count}")
 	set(_isaac_teleop_version "${_isaac_teleop_version_major}.${_isaac_teleop_version_minor}.${_isaac_teleop_version_patch}")
-
-	set(_isaac_teleop_is_ci FALSE)
-	if(DEFINED ENV{CI} AND NOT "$ENV{CI}" STREQUAL "")
-		string(TOLOWER "$ENV{CI}" _isaac_teleop_ci_value)
-		if(NOT _isaac_teleop_ci_value STREQUAL "0" AND NOT _isaac_teleop_ci_value STREQUAL "false")
-			set(_isaac_teleop_is_ci TRUE)
-		endif()
-	endif()
 
 	set(_isaac_teleop_pyproject_version "")
 	set(_isaac_teleop_build_kind "local")
