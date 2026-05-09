@@ -14,7 +14,6 @@
 #   * RC (CI + branch release/X.Y.x): branch must match base version; Python version X.Y.PATCHrc, no local.
 #   * Local working copy (non-CI): Python version X.Y+local and CMake version X.Y (patch omitted).
 function(isaac_teleop_read_version version_file out_cmake_version_var out_pyproject_version_var)
-	find_package(Git REQUIRED)
 	get_filename_component(_isaac_teleop_version_file "${version_file}" ABSOLUTE)
 	if(NOT EXISTS "${_isaac_teleop_version_file}")
 		message(FATAL_ERROR "Version file not found: ${_isaac_teleop_version_file}")
@@ -37,19 +36,30 @@ function(isaac_teleop_read_version version_file out_cmake_version_var out_pyproj
 		endif()
 	endif()
 
-	execute_process(
-		COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse --show-toplevel
-		OUTPUT_VARIABLE _isaac_teleop_git_root
-		OUTPUT_STRIP_TRAILING_WHITESPACE
-		ERROR_QUIET
-		RESULT_VARIABLE _isaac_teleop_git_root_result
-	)
-	if(NOT _isaac_teleop_git_root_result EQUAL 0 OR _isaac_teleop_git_root STREQUAL "")
+	if(_isaac_teleop_is_ci)
+		find_package(Git REQUIRED)
+	else()
+		find_package(Git QUIET)
+	endif()
+
+	set(_isaac_teleop_git_root_result 1)
+	set(_isaac_teleop_git_root "")
+	if(GIT_FOUND)
+		execute_process(
+			COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse --show-toplevel
+			OUTPUT_VARIABLE _isaac_teleop_git_root
+			OUTPUT_STRIP_TRAILING_WHITESPACE
+			ERROR_QUIET
+			RESULT_VARIABLE _isaac_teleop_git_root_result
+		)
+	endif()
+	if(NOT GIT_FOUND OR NOT _isaac_teleop_git_root_result EQUAL 0 OR _isaac_teleop_git_root STREQUAL "")
 		if(_isaac_teleop_is_ci)
 			message(FATAL_ERROR "Failed to determine git root. Ensure this is a git repository and git is available.")
 		endif()
-		# Non-CI fallback: source tree is not inside a usable git checkout (e.g. only a
-		# subdirectory mounted into a container). Emit X.Y+local without consulting git.
+		# Non-CI fallback: git is unavailable, or the source tree is not inside a usable
+		# git checkout (e.g. only a subdirectory mounted into a container). Emit X.Y+local
+		# without consulting git.
 		set(_isaac_teleop_version "${_isaac_teleop_version_major}.${_isaac_teleop_version_minor}")
 		set(_isaac_teleop_pyproject_version "${_isaac_teleop_version_major}.${_isaac_teleop_version_minor}+local")
 		set(${out_cmake_version_var} "${_isaac_teleop_version}" PARENT_SCOPE)
