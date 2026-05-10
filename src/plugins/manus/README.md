@@ -21,9 +21,29 @@ This folder provides a Linux-only example of using the Manus SDK for hand tracki
 
 ## Installation
 
-### Automated Installation (Recommended)
+Manus access has two halves: **device permissions** (kernel/udev, lives on the
+host) and **SDK + plugin build** (lives wherever you build, typically a
+container). The two scripts below split along that line.
 
-Use the provided installation script which handles SDK download, dependency installation, and building:
+### Step 1: grant the host access to the Manus dongle (one-time)
+
+Run this **on the host machine**, not inside a container. udev rules are
+processed by `systemd-udevd`, which does not run inside Docker — so installing
+rules from a container has no effect.
+
+```bash
+cd src/plugins/manus
+./install_udev_rules.sh
+# then unplug + replug the Manus dongle
+```
+
+If you're using the Isaac ROS dev container (`isaac_ros run_dev`), it
+bind-mounts `/dev/bus/usb` from the host, so once the host has the rules
+applied the container will see the dongle with the right permissions.
+
+### Step 2: build the SDK and plugin
+
+Run this **inside the build environment** (devcontainer or Isaac ROS container):
 
 ```bash
 cd src/plugins/manus
@@ -35,6 +55,9 @@ The script will:
 2. Automatically download the MANUS SDK v3.1.1
 3. Extract and configure the SDK in the correct location
 4. Build the plugin
+
+When run inside a container, `install_manus.sh` skips the udev step and
+reminds you to run `install_udev_rules.sh` on the host.
 
 ### Manual Installation
 
@@ -113,12 +136,19 @@ The system will switch dynamically based on the available tracking source. When 
 - **Manus SDK not found at runtime**: The CMake build configures RPATH to find the SDK libraries. If you moved the SDK, you may need to set `LD_LIBRARY_PATH`
 - **No data available**: Ensure Manus Core is running and gloves are properly connected and calibrated
 - **CloudXR runtime errors**: Make sure you've sourced `scripts/setup_cloudxr_env.sh` before running the plugin
-- **Permission denied for USB devices**: The install script configures udev rules. You may need to run:
-  ```bash
-  sudo udevadm control --reload-rules
-  sudo udevadm trigger
-  ```
-  Then reconnect your Manus devices.
+- **Permission denied for USB devices**: udev rules must be installed on the
+  host. Run `./install_udev_rules.sh` from the host (not inside a container),
+  then unplug and replug the dongle. Verify on the host with `ls -l /dev/hidraw*`
+  — entries for the Manus dongle should be mode `0666`.
+- **`udevadm control --reload-rules` fails with "No such file or directory"**:
+  You're inside a container. `systemd-udevd` doesn't run in containers, so this
+  command can never succeed there. Run `install_udev_rules.sh` on the host
+  instead.
+- **Dongle not visible inside the Isaac ROS container** (`lsusb` doesn't show
+  vendor `3325`): the container needs `/dev/bus/usb` bind-mounted from the
+  host. The Isaac ROS dev container does this automatically; for a custom
+  `docker run`, add `-v /dev/bus/usb:/dev/bus/usb` (or `--device=/dev/hidraw<N>`
+  for a specific device).
 
 ## License
 
