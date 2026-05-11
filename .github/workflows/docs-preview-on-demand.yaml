@@ -140,19 +140,6 @@ jobs:
           run-id: ${{ steps.find-build.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download webapp artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: webapp
-          path: ./webapp
-          run-id: ${{ steps.find-build.outputs.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Place webapp under /client/
-        run: |
-          mkdir -p ./docs/build/current/client
-          cp -r ./webapp/. ./docs/build/current/client/
-
       - name: Deploy preview to gh-pages
         uses: peaceiris/actions-gh-pages@v4
         with:
