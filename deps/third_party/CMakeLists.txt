@@ -186,7 +186,8 @@ if(BUILD_PYTHON_BINDINGS)
         GIT_SHALLOW          YES
         SOURCE_DIR           "${CMAKE_BINARY_DIR}/_deps/nlopt-python-src"
         CONFIGURE_COMMAND
-            "${UV_EXECUTABLE}" venv --python "${Python3_EXECUTABLE}" "${_nlopt_venv}"
+            ${CMAKE_COMMAND} -E rm -rf "${_nlopt_venv}"
+            COMMAND "${UV_EXECUTABLE}" venv --python "${Python3_EXECUTABLE}" "${_nlopt_venv}"
             COMMAND "${UV_EXECUTABLE}" pip install --python "${_nlopt_python}"
                 numpy setuptools wheel
         BUILD_COMMAND

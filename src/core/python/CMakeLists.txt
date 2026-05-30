@@ -42,6 +42,17 @@ else()
     set(ROBOTIC_GROUNDING_PACKAGE_DATA_BLOCK "")
 endif()
 
+# nlopt is built from source by CMake (deps/third_party/CMakeLists.txt) and
+# bundled directly into the isaacteleop wheel so that `pip install isaacteleop`
+# works on all platforms without a separate nlopt wheel on PyPI.
+if(TARGET nlopt_python_wheel)
+    set(NLOPT_PACKAGES_BLOCK "    \"nlopt\",\n")
+    set(NLOPT_PACKAGE_DATA_BLOCK "\"nlopt\" = [\"*.so\", \"*.pyd\"]\n")
+else()
+    set(NLOPT_PACKAGES_BLOCK "")
+    set(NLOPT_PACKAGE_DATA_BLOCK "")
+endif()
+
 # Generate pyproject.toml from template with ISAAC_TELEOP_PYPROJECT_VERSION
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/pyproject.toml.in"
@@ -106,6 +117,17 @@ if(BUNDLE_ROBOTIC_GROUNDING)
             "${ROBOTIC_GROUNDING_SRC}"
             "${CMAKE_BINARY_DIR}/python_package/$<CONFIG>/robotic_grounding"
         COMMENT "Bundling robotic_grounding/ into wheel staging dir for [grounding] extra"
+    )
+endif()
+
+if(TARGET nlopt_python_wheel)
+    add_dependencies(python_package nlopt_python_wheel)
+    add_custom_command(TARGET python_package POST_BUILD
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/bundle_nlopt.py"
+            "${CMAKE_BINARY_DIR}/wheels"
+            "${CMAKE_BINARY_DIR}/python_package/$<CONFIG>"
+        COMMENT "Bundling nlopt package files into isaacteleop wheel staging dir"
     )
 endif()
 
