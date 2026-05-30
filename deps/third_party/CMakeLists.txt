@@ -156,6 +156,48 @@ add_library(mcap::mcap ALIAS mcap_interface)
 message(STATUS "MCAP interface library configured")
 
 # ==============================================================================
+# nlopt-python wheel
+# ==============================================================================
+# PyPI does not publish pre-built nlopt wheels for all platforms (e.g. aarch64).
+# Build a local wheel at cmake --build time so the pip install step always works
+# via --find-links=./install/wheels/ regardless of host architecture.
+if(BUILD_PYTHON_BINDINGS)
+    find_program(SWIG_EXECUTABLE swig)
+    if(NOT SWIG_EXECUTABLE)
+        message(FATAL_ERROR
+            "swig not found – required to build the nlopt Python wheel.\n"
+            "Install with: sudo apt-get install -y swig")
+    endif()
+
+    include(ExternalProject)
+
+    set(_nlopt_venv "${CMAKE_BINARY_DIR}/_deps/nlopt-python-venv")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+        set(_nlopt_python "${_nlopt_venv}/Scripts/python.exe")
+    else()
+        set(_nlopt_python "${_nlopt_venv}/bin/python")
+    endif()
+
+    message(STATUS "Configuring nlopt-python wheel build (DanielBok/nlopt-python 2.10.0)...")
+    ExternalProject_Add(nlopt_python_wheel
+        GIT_REPOSITORY       https://github.com/DanielBok/nlopt-python.git
+        GIT_TAG              2.10.0
+        GIT_SUBMODULES_RECURSE YES
+        GIT_SHALLOW          YES
+        SOURCE_DIR           "${CMAKE_BINARY_DIR}/_deps/nlopt-python-src"
+        CONFIGURE_COMMAND
+            "${UV_EXECUTABLE}" venv --python "${Python3_EXECUTABLE}" "${_nlopt_venv}"
+            COMMAND "${UV_EXECUTABLE}" pip install --python "${_nlopt_python}"
+                numpy setuptools wheel
+        BUILD_COMMAND
+            ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/wheels"
+            COMMAND "${_nlopt_python}" setup.py bdist_wheel -d "${CMAKE_BINARY_DIR}/wheels"
+        BUILD_IN_SOURCE      YES
+        INSTALL_COMMAND      ""
+    )
+endif()
+
+# ==============================================================================
 # GLM (Vulkan/GLSL math)
 # ==============================================================================
 # Header-only math library used by the viz module for matrix / vector / quaternion
