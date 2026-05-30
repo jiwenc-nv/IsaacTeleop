@@ -5,6 +5,7 @@
 
 import argparse
 import os
+import re
 import signal
 import sys
 import time
@@ -169,6 +170,17 @@ def main() -> None:
         print(
             f"CloudXR WSS proxy: \033[36mrunning\033[0m, log file: \033[90m{wss_log}\033[0m"
         )
+        # Print the WebXR client matching this release line, derived from the
+        # installed version's leading MAJOR.MINOR (present for every build
+        # type). The client is published per release line on GitHub Pages.
+        client_base = "https://nvidia.github.io/IsaacTeleop/client/"
+        ver_match = re.match(r"(\d+)\.(\d+)", isaacteleop_version)
+        client_url = (
+            f"{client_base}release-{ver_match.group(1)}.{ver_match.group(2)}.x/"
+            if ver_match
+            else client_base
+        )
+        print(f"WebXR client:      \033[36m{client_url}\033[0m")
         if args.setup_oob:
             if args.usb_local:
                 print(
