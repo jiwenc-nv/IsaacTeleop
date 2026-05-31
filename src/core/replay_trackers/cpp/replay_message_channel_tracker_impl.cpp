@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "replay_message_channel_tracker_impl.hpp"
+#include "inc/replay_trackers/replay_message_channel_tracker_impl.hpp"
 
 #include <mcap/reader.hpp>
 #include <mcap/recording_traits.hpp>

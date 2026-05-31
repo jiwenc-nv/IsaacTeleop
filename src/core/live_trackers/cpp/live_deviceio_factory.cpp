@@ -3,13 +3,13 @@
 
 #include "inc/live_trackers/live_deviceio_factory.hpp"
 
-#include "live_controller_tracker_impl.hpp"
-#include "live_frame_metadata_tracker_oak_impl.hpp"
-#include "live_full_body_tracker_pico_impl.hpp"
-#include "live_generic_3axis_pedal_tracker_impl.hpp"
-#include "live_hand_tracker_impl.hpp"
-#include "live_head_tracker_impl.hpp"
-#include "live_message_channel_tracker_impl.hpp"
+#include "inc/live_trackers/live_controller_tracker_impl.hpp"
+#include "inc/live_trackers/live_frame_metadata_tracker_oak_impl.hpp"
+#include "inc/live_trackers/live_full_body_tracker_pico_impl.hpp"
+#include "inc/live_trackers/live_generic_3axis_pedal_tracker_impl.hpp"
+#include "inc/live_trackers/live_hand_tracker_impl.hpp"
+#include "inc/live_trackers/live_head_tracker_impl.hpp"
+#include "inc/live_trackers/live_message_channel_tracker_impl.hpp"
 
 #include <deviceio_trackers/controller_tracker.hpp>
 #include <deviceio_trackers/frame_metadata_tracker_oak.hpp>

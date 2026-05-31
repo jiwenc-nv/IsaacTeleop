@@ -12,12 +12,12 @@ add_library(replay_trackers STATIC
     replay_generic_3axis_pedal_tracker_impl.cpp
     replay_message_channel_tracker_impl.cpp
     inc/replay_trackers/replay_deviceio_factory.hpp
-    replay_hand_tracker_impl.hpp
-    replay_head_tracker_impl.hpp
-    replay_controller_tracker_impl.hpp
-    replay_full_body_tracker_pico_impl.hpp
-    replay_generic_3axis_pedal_tracker_impl.hpp
-    replay_message_channel_tracker_impl.hpp
+    inc/replay_trackers/replay_hand_tracker_impl.hpp
+    inc/replay_trackers/replay_head_tracker_impl.hpp
+    inc/replay_trackers/replay_controller_tracker_impl.hpp
+    inc/replay_trackers/replay_full_body_tracker_pico_impl.hpp
+    inc/replay_trackers/replay_generic_3axis_pedal_tracker_impl.hpp
+    inc/replay_trackers/replay_message_channel_tracker_impl.hpp
 )
 
 target_include_directories(replay_trackers

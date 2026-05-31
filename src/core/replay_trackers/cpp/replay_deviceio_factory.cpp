@@ -3,12 +3,12 @@
 
 #include "inc/replay_trackers/replay_deviceio_factory.hpp"
 
-#include "replay_controller_tracker_impl.hpp"
-#include "replay_full_body_tracker_pico_impl.hpp"
-#include "replay_generic_3axis_pedal_tracker_impl.hpp"
-#include "replay_hand_tracker_impl.hpp"
-#include "replay_head_tracker_impl.hpp"
-#include "replay_message_channel_tracker_impl.hpp"
+#include "inc/replay_trackers/replay_controller_tracker_impl.hpp"
+#include "inc/replay_trackers/replay_full_body_tracker_pico_impl.hpp"
+#include "inc/replay_trackers/replay_generic_3axis_pedal_tracker_impl.hpp"
+#include "inc/replay_trackers/replay_hand_tracker_impl.hpp"
+#include "inc/replay_trackers/replay_head_tracker_impl.hpp"
+#include "inc/replay_trackers/replay_message_channel_tracker_impl.hpp"
 
 #include <deviceio_trackers/controller_tracker.hpp>
 #include <deviceio_trackers/full_body_tracker_pico.hpp>

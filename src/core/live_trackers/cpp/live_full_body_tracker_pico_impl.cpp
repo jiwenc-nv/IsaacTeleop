@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "live_full_body_tracker_pico_impl.hpp"
+#include "inc/live_trackers/live_full_body_tracker_pico_impl.hpp"
 
 #include <mcap/recording_traits.hpp>
 #include <oxr_utils/oxr_funcs.hpp>

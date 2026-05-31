@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "live_message_channel_tracker_impl.hpp"
+#include "inc/live_trackers/live_message_channel_tracker_impl.hpp"
 
 #include <mcap/recording_traits.hpp>
 #include <oxr_utils/oxr_funcs.hpp>

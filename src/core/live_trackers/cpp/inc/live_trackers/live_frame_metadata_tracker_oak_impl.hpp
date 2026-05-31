@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "inc/live_trackers/schema_tracker.hpp"
+#include "schema_tracker.hpp"
 
 #include <deviceio_trackers/frame_metadata_tracker_oak.hpp>
 #include <oxr_utils/oxr_session_handles.hpp>
