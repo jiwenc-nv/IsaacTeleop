@@ -385,9 +385,11 @@ class TeleopRos2Node(Node):
             return self._run_session_loop()
 
         with CloudXRLauncher(
-            install_dir=self._params.cloudxr_install_dir,
-            env_config=self._params.cloudxr_env_config,
-            accept_eula=self._params.cloudxr_accept_eula,
+            install_dir=self._params.cloudxr_params.install_dir,
+            env_config=self._params.cloudxr_params.env_config,
+            accept_eula=self._params.cloudxr_params.accept_eula,
+            setup_oob=self._params.cloudxr_params.setup_oob,
+            usb_local=self._params.cloudxr_params.usb_local,
         ) as launcher:
             self.get_logger().info(
                 "CloudXR runtime and WSS proxy started "
