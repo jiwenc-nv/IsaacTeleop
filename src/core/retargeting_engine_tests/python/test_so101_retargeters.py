@@ -3,12 +3,11 @@
 
 """Sim-free unit tests for the SO-101 XR teleop retargeters.
 
-Covers the SO-101 retargeters that drive the position-only IK stacking pipeline:
+Covers the SO-101 retargeters that drive the full-pose SE3 IK stacking pipeline:
 
 * :class:`~isaacteleop.retargeters.SO101GripperRetargeter` -- analog trigger -> jaw closedness.
-* :class:`~isaacteleop.retargeters.SO101WristRetargeter` -- grip roll -> absolute wrist-roll
-  angle via swing-twist decomposition, plus absolute world-elevation pitch.
-* :class:`~isaacteleop.retargeters.SO101ClutchRetargeter` -- clutch-rebased absolute EE pose.
+* :class:`~isaacteleop.retargeters.SO101ClutchRetargeter` -- clutch-rebased absolute EE pose
+  (position + calibration-composed grip orientation) for the 5-joint pose IK.
 
 Each retargeter is exercised both at the pure-math level (the module-private helper functions)
 and at the ``BaseRetargeter.compute`` level (build inputs/outputs, drive a frame, read the
@@ -39,27 +38,16 @@ from isaacteleop.retargeting_engine.tensor_types import (
 from isaacteleop.retargeters import (
     SO101ClutchRetargeter,
     SO101GripperRetargeter,
-    SO101RollRetargeter,
 )
-from isaacteleop.retargeters import SO101WristRetargeter
 from isaacteleop.retargeters.SO101.clutch_retargeter import (
     _CLUTCH_HOME_EE_POS,
+    _quat_mul,
     _rebased_position,
 )
 from isaacteleop.retargeters.SO101.gripper_retargeter import (
     GRIPPER_COMMAND_KEY,
     _TRIGGER_DEADZONE,
     _trigger_to_closedness,
-)
-from isaacteleop.retargeters.SO101.wrist_retargeter import (
-    PITCH_COMMAND_KEY,
-    ROLL_COMMAND_KEY,
-    _APPROACH_AXIS,
-    _PITCH_APPROACH_AXIS,
-    _approach_elevation,
-    _roll_twist,
-    _swing_twist_angle,
-    _WRIST_ROLL_OFFSET_RAD,
 )
 
 # ---------------------------------------------------------------------------
@@ -224,340 +212,6 @@ class TestSO101GripperRetargeter:
 
 
 # ===========================================================================
-# SO101RollRetargeter
-# ===========================================================================
-
-
-class TestSwingTwistAngle:
-    """The pure swing-twist decomposition used by the roll retargeter."""
-
-    def test_identity_is_zero(self):
-        """The identity quaternion has zero twist about any axis."""
-        assert _swing_twist_angle(
-            np.array([0.0, 0.0, 0.0, 1.0]), _APPROACH_AXIS
-        ) == pytest.approx(0.0)
-
-    @pytest.mark.parametrize("phi", [0.3, 1.0, -0.7, 2.5, -2.5])
-    def test_pure_roll_about_z(self, phi):
-        """A pure roll of phi about Z recovers phi."""
-        q = _quat_xyzw([0.0, 0.0, 1.0], phi)
-        assert _swing_twist_angle(q, _APPROACH_AXIS) == pytest.approx(phi, abs=1e-9)
-
-    @pytest.mark.parametrize("axis", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-    def test_pure_swing_is_zero(self, axis):
-        """A pure swing (tilt) about X or Y has zero twist about Z."""
-        q = _quat_xyzw(axis, 0.9)
-        assert _swing_twist_angle(q, _APPROACH_AXIS) == pytest.approx(0.0, abs=1e-9)
-
-    def test_sign(self):
-        """Twist sign follows the rotation sign about the axis."""
-        assert (
-            _swing_twist_angle(_quat_xyzw([0.0, 0.0, 1.0], 0.6), _APPROACH_AXIS) > 0.0
-        )
-        assert (
-            _swing_twist_angle(_quat_xyzw([0.0, 0.0, 1.0], -0.6), _APPROACH_AXIS) < 0.0
-        )
-
-    def test_near_180_swing_guard(self):
-        """A ~180-degree swing about X (no twist component) hits the degeneracy guard."""
-        q = _quat_xyzw([1.0, 0.0, 0.0], math.pi)
-        assert _swing_twist_angle(q, _APPROACH_AXIS) == pytest.approx(0.0, abs=1e-9)
-
-    def test_scipy_cross_check_orthogonal_swing(self):
-        """Cross-check the twist against scipy for a roll composed with an orthogonal swing."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        phi = 0.8
-        r_swing = Rotation.from_rotvec([0.5, 0.0, 0.0])
-        r_twist = Rotation.from_rotvec([0.0, 0.0, phi])
-        q = (r_twist * r_swing).as_quat()  # scipy returns [x, y, z, w]
-        assert _swing_twist_angle(q, _APPROACH_AXIS) == pytest.approx(phi, abs=1e-9)
-
-    def test_scipy_cross_check_non_orthogonal_swing(self):
-        """Cross-check against scipy for a NON-orthogonal swing (swing axis has a Z component).
-
-        The orthogonal-X-swing case passes under either twist convention, so it does not pin the
-        decomposition. A swing about an axis with a Z component genuinely exercises the
-        swing-twist split: the recovered twist is no longer simply the planted ``phi``.
-        """
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        phi = 0.8
-        swing_axis = np.array([1.0, 0.0, 0.4])
-        swing_axis = swing_axis / np.linalg.norm(swing_axis)
-        r_swing = Rotation.from_rotvec(0.6 * swing_axis)
-        r_twist = Rotation.from_rotvec([0.0, 0.0, phi])
-        q = (r_twist * r_swing).as_quat()
-
-        # Independent quaternion-projection twist about Z (oracle).
-        qn = np.asarray(q, dtype=np.float64)
-        if qn[3] < 0.0:
-            qn = -qn
-        twist = np.array([0.0, 0.0, qn[2], qn[3]])
-        twist /= np.linalg.norm(twist)
-        expected = 2.0 * math.atan2(twist[2], twist[3])
-
-        assert (
-            abs(expected - phi) > 0.05
-        )  # the non-orthogonal swing genuinely perturbs the twist
-        assert _swing_twist_angle(q, _APPROACH_AXIS) == pytest.approx(
-            expected, abs=1e-9
-        )
-
-
-class TestRollTwistMath:
-    """The pure relative-twist helper: twist of ``ref^-1 . cur`` about the controller local axis."""
-
-    def test_pure_local_roll_recovered(self):
-        """A pure roll about the local axis since the reference is recovered 1:1."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        R0 = Rotation.from_euler(
-            "y", 90, degrees=True
-        )  # tilted grasp (approach horizontal)
-        phi = 0.5
-        cur = (R0 * Rotation.from_rotvec([0.0, 0.0, phi])).as_quat()
-        assert _roll_twist(R0.as_quat(), cur, _APPROACH_AXIS) == pytest.approx(
-            phi, abs=1e-9
-        )
-
-    @pytest.mark.parametrize("axis", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-    def test_off_axis_rotation_rejected(self, axis):
-        """A rotation about a local axis perpendicular to the roll axis yields ~zero twist."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        R0 = Rotation.from_euler("y", 90, degrees=True)
-        cur = (R0 * Rotation.from_rotvec(np.array(axis) * 0.5)).as_quat()
-        assert _roll_twist(R0.as_quat(), cur, _APPROACH_AXIS) == pytest.approx(
-            0.0, abs=1e-9
-        )
-
-    def test_identity_reference_matches_swing_twist(self):
-        """With an identity reference the relative twist equals the absolute swing-twist."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        cur = Rotation.from_rotvec([0.2, -0.1, 0.4]).as_quat()
-        ident = np.array([0.0, 0.0, 0.0, 1.0])
-        assert _roll_twist(ident, cur, _APPROACH_AXIS) == pytest.approx(
-            _swing_twist_angle(cur, _APPROACH_AXIS), abs=1e-12
-        )
-
-
-class TestSO101RollRetargeter:
-    """End-to-end ``compute`` behavior of the wrist-roll retargeter (engage-relative)."""
-
-    @staticmethod
-    def _roll(r, grip_ori, **ctx):
-        inputs, outputs = _build_io(r)
-        inputs[ControllersSource.RIGHT] = _make_controller(
-            grip_ori=np.asarray(grip_ori, dtype=np.float32)
-        )
-        r.compute(inputs, outputs, _make_context(**ctx))
-        return float(outputs[ROLL_COMMAND_KEY][0])
-
-    def test_output_spec_has_roll_command_key(self):
-        """Output spec contains the roll command key (among other channels)."""
-        r = SO101RollRetargeter(name="roll")
-        assert ROLL_COMMAND_KEY in r.output_spec()
-
-    def test_engage_emits_offset(self):
-        """The first RUNNING frame latches the reference orientation and emits the offset seed."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        r = SO101RollRetargeter(name="roll")
-        out = self._roll(r, Rotation.from_euler("y", 90, degrees=True).as_quat())
-        assert out == pytest.approx(_WRIST_ROLL_OFFSET_RAD, abs=1e-6)
-
-    @pytest.mark.parametrize("phi", [0.4, -1.1, 2.0])
-    def test_relative_roll_about_local_z(self, phi):
-        """A roll of phi about the controller local Z since engage emits roll == offset + phi."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        r = SO101RollRetargeter(name="roll")
-        R0 = Rotation.from_euler(
-            "xy", [20, 35], degrees=True
-        )  # arbitrary engage orientation
-        self._roll(r, R0.as_quat())  # engage
-        out = self._roll(r, (R0 * Rotation.from_rotvec([0.0, 0.0, phi])).as_quat())
-        assert out == pytest.approx(_WRIST_ROLL_OFFSET_RAD + phi, abs=1e-6)
-
-    def test_off_axis_rotations_do_not_leak(self):
-        """Pitch/yaw about local axes perpendicular to the roll axis do not move the roll output.
-
-        This is the regression for the cross-coupling bug: with the old absolute twist about a
-        fixed world axis, a hand pitch or yaw at a non-vertical grasp leaked fully into wrist_roll.
-        """
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        r = SO101RollRetargeter(name="roll")
-        R0 = Rotation.from_euler(
-            "y", 90, degrees=True
-        )  # approach horizontal: worst case for fixed-Z
-        self._roll(r, R0.as_quat())  # engage
-        # Rotations about local X and local Y (perpendicular to the local-Z roll axis) -> stay at
-        # the engage seed (offset).
-        assert self._roll(
-            r, (R0 * Rotation.from_rotvec([0.5, 0.0, 0.0])).as_quat()
-        ) == pytest.approx(_WRIST_ROLL_OFFSET_RAD, abs=1e-6)
-        assert self._roll(
-            r, (R0 * Rotation.from_rotvec([0.0, 0.5, 0.0])).as_quat()
-        ) == pytest.approx(_WRIST_ROLL_OFFSET_RAD, abs=1e-6)
-        # A roll about local Z still maps 1:1 on top of the offset.
-        assert self._roll(
-            r, (R0 * Rotation.from_rotvec([0.0, 0.0, 0.5])).as_quat()
-        ) == pytest.approx(_WRIST_ROLL_OFFSET_RAD + 0.5, abs=1e-6)
-
-    def test_reengage_resumes_running_roll(self):
-        """A re-clutch resumes from the last commanded roll (no snap), then accumulates."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        r = SO101RollRetargeter(name="roll")
-        self._roll(r, Rotation.identity().as_quat())  # engage at identity
-        phi1 = 0.6
-        base = _WRIST_ROLL_OFFSET_RAD
-        assert self._roll(
-            r, Rotation.from_rotvec([0.0, 0.0, phi1]).as_quat()
-        ) == pytest.approx(base + phi1, abs=1e-6)
-
-        # Disengage (STOPPED) -> hold, re-arm reference.
-        assert self._roll(
-            r, Rotation.identity().as_quat(), state=ExecutionState.STOPPED
-        ) == pytest.approx(base + phi1, abs=1e-6)
-        assert r._ref_quat is None
-
-        # Re-engage at a NEW orientation -> resume from base + phi1 (no jump), then a further
-        # local-Z roll of phi2 accumulates on top.
-        R1 = Rotation.from_euler("z", 80, degrees=True)
-        assert self._roll(r, R1.as_quat()) == pytest.approx(base + phi1, abs=1e-6)
-        phi2 = -0.3
-        assert self._roll(
-            r, (R1 * Rotation.from_rotvec([0.0, 0.0, phi2])).as_quat()
-        ) == pytest.approx(base + phi1 + phi2, abs=1e-6)
-
-    def test_reset_returns_to_offset(self):
-        """A reset re-zeros the running roll back to the offset seed."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        r = SO101RollRetargeter(name="roll")
-        self._roll(r, Rotation.identity().as_quat())  # engage
-        self._roll(r, Rotation.from_rotvec([0.0, 0.0, 0.9]).as_quat())  # roll away
-        out = self._roll(r, Rotation.identity().as_quat(), reset=True)
-        assert out == pytest.approx(_WRIST_ROLL_OFFSET_RAD, abs=1e-6)
-
-    def test_not_running_holds_without_latching(self):
-        """While not RUNNING the roll holds the last value and does not latch a reference."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        r = SO101RollRetargeter(name="roll")
-        out = self._roll(
-            r,
-            Rotation.from_rotvec([0.0, 0.0, 0.7]).as_quat(),
-            state=ExecutionState.STOPPED,
-        )
-        assert out == pytest.approx(
-            _WRIST_ROLL_OFFSET_RAD, abs=1e-6
-        )  # offset, never engaged
-        assert r._ref_quat is None
-
-    def test_dropped_frame_holds_last(self):
-        """An absent controller frame holds the last commanded roll."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        r = SO101RollRetargeter(name="roll")
-        self._roll(r, Rotation.identity().as_quat())  # engage
-        self._roll(
-            r, Rotation.from_rotvec([0.0, 0.0, 0.7]).as_quat()
-        )  # roll to offset + 0.7
-
-        inputs2, outputs2 = _build_io(r)  # controller absent
-        r.compute(inputs2, outputs2, _make_context())
-        assert float(outputs2[ROLL_COMMAND_KEY][0]) == pytest.approx(
-            _WRIST_ROLL_OFFSET_RAD + 0.7, abs=1e-6
-        )
-
-    def test_roll_alias_points_at_wrist_retargeter(self):
-        """The legacy SO101RollRetargeter name still resolves (back-compat alias)."""
-        from isaacteleop.retargeters import SO101RollRetargeter as Legacy
-        from isaacteleop.retargeters import SO101WristRetargeter
-
-        assert Legacy is SO101WristRetargeter
-
-
-# ===========================================================================
-# SO101WristRetargeter (pitch channel)
-# ===========================================================================
-
-
-class TestApproachElevationMath:
-    """The pure approach-axis elevation helper used by the wrist retargeter's pitch channel."""
-
-    def test_horizontal_is_zero(self):
-        """An orientation that rotates the approach axis into the horizontal plane gives 0."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        # Rotate the approach axis (+Z) to horizontal via +90deg about Y -> [1, 0, 0].
-        q = Rotation.from_euler("y", 90, degrees=True).as_quat()
-        assert _approach_elevation(q) == pytest.approx(0.0, abs=1e-9)
-
-    def test_identity_points_along_approach_axis(self):
-        """At identity the approach axis is _PITCH_APPROACH_AXIS, so elevation is its own."""
-        expected = math.atan2(
-            _PITCH_APPROACH_AXIS[2],
-            math.hypot(_PITCH_APPROACH_AXIS[0], _PITCH_APPROACH_AXIS[1]),
-        )
-        assert _approach_elevation(_ID_QUAT) == pytest.approx(expected, abs=1e-9)
-
-    @pytest.mark.parametrize(
-        "euler", [(0, 30, 0), (0, -25, 0), (45, 0, 0), (20, 35, 10), (0, 90, 0)]
-    )
-    def test_matches_scipy_for_arbitrary_orientation(self, euler):
-        """Cross-check the helper's quaternion math against scipy for arbitrary orientations.
-
-        Rotating the approach axis by the orientation and taking atan2(z, ||xy||) is the oracle;
-        the helper must match it (guards the quaternion sandwich/convention, not a planted angle).
-        """
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        R = Rotation.from_euler("xyz", euler, degrees=True)
-        axis = R.apply(_PITCH_APPROACH_AXIS)
-        expected = math.atan2(axis[2], math.hypot(axis[0], axis[1]))
-        assert _approach_elevation(R.as_quat()) == pytest.approx(expected, abs=1e-9)
-
-
-class TestSO101WristRetargeterPitch:
-    """The wrist retargeter emits an ABSOLUTE pitch channel (no engage latching)."""
-
-    @staticmethod
-    def _pitch(r, aim_ori, **ctx):
-        # Pitch is driven by the AIM pose (pointer ray), not the grip pose.
-        inputs, outputs = _build_io(r)
-        inputs[ControllersSource.RIGHT] = _make_controller(
-            aim_ori=np.asarray(aim_ori, dtype=np.float32)
-        )
-        r.compute(inputs, outputs, _make_context(**ctx))
-        return float(outputs[PITCH_COMMAND_KEY][0])
-
-    def test_output_spec_has_pitch_and_roll(self):
-        """The wrist retargeter exposes both the roll and pitch command channels."""
-        from isaacteleop.retargeters.SO101.wrist_retargeter import ROLL_COMMAND_KEY
-
-        r = SO101WristRetargeter(name="wrist")
-        assert set(r.output_spec()) == {ROLL_COMMAND_KEY, PITCH_COMMAND_KEY}
-
-    def test_pitch_is_absolute_not_engage_relative(self):
-        """The same aim pose yields the same pitch regardless of when teleop engaged."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        pose = Rotation.from_euler("y", 30, degrees=True).as_quat()
-        # Two frames suffice: pitch has no accumulated/engage state, so this test would catch
-        # a future regression that added engage-relative pitch state.
-        r1 = SO101WristRetargeter(name="wrist")
-        first = self._pitch(r1, pose)  # engage frame
-        r2 = SO101WristRetargeter(name="wrist")
-        self._pitch(
-            r2, Rotation.from_euler("y", -50, degrees=True).as_quat()
-        )  # different engage
-        second = self._pitch(r2, pose)
-        assert first == pytest.approx(second, abs=1e-6)
-
-    def test_pitch_dropped_frame_holds_last(self):
-        """An absent controller frame holds the last commanded pitch."""
-        Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
-        r = SO101WristRetargeter(name="wrist")
-        self._pitch(r, Rotation.from_euler("y", 20, degrees=True).as_quat())
-        inputs2, outputs2 = _build_io(r)  # controller absent
-        r.compute(inputs2, outputs2, _make_context())
-        held = float(outputs2[PITCH_COMMAND_KEY][0])
-        again = self._pitch(r, Rotation.from_euler("y", 20, degrees=True).as_quat())
-        assert held == pytest.approx(again, abs=1e-6)
-
-
-# ===========================================================================
 # SO101ClutchRetargeter
 # ===========================================================================
 
@@ -623,9 +277,13 @@ class TestSO101ClutchRetargeter:
         """The first RUNNING frame latches the origin so the EE sits exactly at the configured home.
 
         On the latching frame ``p_ctrl == origin`` so the emitted position equals home (no
-        teleport on engage). The grip orientation passes through unchanged.
+        teleport on engage). An identity offset is used here so the grip orientation passes
+        through unchanged (the default ``Rz(pi)`` offset is covered by
+        :meth:`test_calibration_offset_composed_into_orientation`).
         """
-        r = SO101ClutchRetargeter(name="ee_pose")
+        r = SO101ClutchRetargeter(
+            name="ee_pose", orientation_offset=np.array([0.0, 0.0, 0.0, 1.0])
+        )
         inputs, outputs = _build_io(r)
         grip_ori = _quat_xyzw([0, 0, 1], 0.3).astype(np.float32)
         inputs[ControllersSource.RIGHT] = _make_controller(
@@ -752,3 +410,49 @@ class TestSO101ClutchRetargeter:
         inputs2, outputs2 = _build_io(r)  # controller absent
         r.compute(inputs2, outputs2, _make_context())
         np.testing.assert_allclose(_read_pose(outputs2), first, atol=1e-9)
+
+    def test_calibration_offset_composed_into_orientation(self):
+        """The fixed orientation offset right-multiplies (body frame) the grip orientation.
+
+        The default offset is ``Rz(pi)`` (a roll about the shared approach axis), composed as a
+        body-frame right multiply (``grip (x) offset``) and renormalized to unit. An explicit
+        identity offset passes the grip orientation through unchanged.
+        """
+        grip = _quat_xyzw([0.0, 1.0, 0.0], 0.4).astype(np.float32)
+
+        # Explicit identity offset: passthrough.
+        r = SO101ClutchRetargeter(
+            name="ee_pose", orientation_offset=np.array([0.0, 0.0, 0.0, 1.0])
+        )
+        inputs, outputs = _build_io(r)
+        inputs[ControllersSource.RIGHT] = _make_controller(
+            grip_pos=(0.5, -0.3, 0.7), grip_ori=grip
+        )
+        r.compute(inputs, outputs, _make_context())
+        np.testing.assert_allclose(_read_pose(outputs)[3:], grip, atol=1e-6)
+
+        # Default offset: emitted == grip (x) Rz(pi) (body-frame right multiply), unit.
+        r_def = SO101ClutchRetargeter(name="ee_pose")
+        inputs_def, outputs_def = _build_io(r_def)
+        inputs_def[ControllersSource.RIGHT] = _make_controller(
+            grip_pos=(0.5, -0.3, 0.7), grip_ori=grip
+        )
+        r_def.compute(inputs_def, outputs_def, _make_context())
+        rz_pi = np.array([0.0, 0.0, 1.0, 0.0])  # Rz(pi), xyzw
+        expected_def = _quat_mul(grip.astype(np.float64), rz_pi)
+        expected_def = expected_def / np.linalg.norm(expected_def)
+        np.testing.assert_allclose(_read_pose(outputs_def)[3:], expected_def, atol=1e-6)
+
+        # Non-identity offset: emitted == grip (x) offset (right multiply), renormalized to unit.
+        offset = _quat_xyzw([0.0, 0.0, 1.0], 0.9)
+        r2 = SO101ClutchRetargeter(name="ee_pose", orientation_offset=offset)
+        inputs2, outputs2 = _build_io(r2)
+        inputs2[ControllersSource.RIGHT] = _make_controller(
+            grip_pos=(0.5, -0.3, 0.7), grip_ori=grip
+        )
+        r2.compute(inputs2, outputs2, _make_context())
+        emitted = _read_pose(outputs2)[3:]
+        expected = _quat_mul(grip.astype(np.float64), offset)
+        expected = expected / np.linalg.norm(expected)
+        np.testing.assert_allclose(emitted, expected, atol=1e-6)
+        assert np.linalg.norm(emitted) == pytest.approx(1.0, abs=1e-6)

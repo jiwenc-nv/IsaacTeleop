@@ -4,22 +4,21 @@
 Retargeters: SO-101 (5-DOF arm)
 ===============================
 
-The SO-101 is a low-cost 5-DOF arm with a single-jaw gripper. Its task-space IK is
-**position-only** -- a 5-DOF arm cannot track a full 6-DOF end-effector pose -- so the standard
-:class:`~isaacteleop.retargeters.Se3AbsRetargeter` + :class:`~isaacteleop.retargeters.GripperRetargeter`
-pairing does not fit. These three retargeters provide the missing pieces for comfortable XR
-controller teleoperation of the arm (used by the Isaac Lab ``Isaac-Stack-Cube-SO101-IK-Abs-v0``
+The SO-101 is a low-cost 5-DOF arm with a single-jaw gripper. The controller is meant to feel
+like holding the **leader arm**: the gripper pose follows the controller pose directly. A
+full SE3 pose is commanded and a single differential IK solves all 5 arm joints, tracking
+position exactly and orientation best-effort (a 5-DOF arm is over-determined by one DOF on a
+6-DOF pose). These two retargeters provide the pieces for comfortable XR controller
+teleoperation of the arm (used by the Isaac Lab ``Isaac-Stack-Cube-SO101-IK-Abs-v0``
 cube-stacking task):
 
-* :class:`~isaacteleop.retargeters.SO101ClutchRetargeter` -- absolute EE **position** with
-  clutch-style rebasing (no teleport on engage).
-* :class:`~isaacteleop.retargeters.SO101RollRetargeter` -- recovers the controller's roll as a
-  dedicated ``wrist_roll`` joint channel that position-only IK would otherwise drop.
+* :class:`~isaacteleop.retargeters.SO101ClutchRetargeter` -- absolute EE **pose** (position +
+  orientation) with clutch-style position rebasing (no teleport on engage).
 * :class:`~isaacteleop.retargeters.SO101GripperRetargeter` -- proportional (analog) jaw
   closedness from the controller trigger.
 
-Together they flatten (via :class:`~isaacteleop.retargeters.TensorReorderer`) into a 5-D action
-``[pos_x, pos_y, pos_z, roll, gripper]``.
+Together they flatten (via :class:`~isaacteleop.retargeters.TensorReorderer`) into an 8-D action
+``[pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w, gripper]``.
 
 At a glance
 -----------
@@ -34,11 +33,9 @@ At a glance
    * - ``SO101ClutchRetargeter``
      - 7-D ``ee_pose`` (xyz + xyzw quat)
      - Same output contract as ``Se3AbsRetargeter``, but rebases controller motion around an
-       origin captured on engage: ``pos = home + scale * R_base_from_world @ (p_ctrl - p0)``.
-       The quaternion is a passthrough and is dropped downstream.
-   * - ``SO101RollRetargeter``
-     - 1 float ``roll_command`` [rad]
-     - Absolute swing-twist twist of the grip about fixed world Z, driving ``wrist_roll``.
+       origin captured on engage: ``pos = home + scale * (p_ctrl - p0)``. The orientation is
+       the controller grip orientation composed with a fixed calibration offset; it drives the
+       SE3 IK.
    * - ``SO101GripperRetargeter``
      - 1 float ``gripper_command`` ``c`` in ``[0, 1]``
      - Trigger -> jaw closedness (``0`` = open, ``1`` = closed), with a released-end deadzone.
@@ -49,52 +46,43 @@ Why a clutch
 ``Se3AbsRetargeter`` maps the controller's absolute position straight to the EE target, so
 engaging teleop teleports the arm to wherever the controller happens to be. The clutch instead
 **re-arms** whenever teleop is not ``RUNNING`` and latches a controller origin ``p0`` on the
-first ``RUNNING`` frame (the headset "Play"). From then on the EE is driven by the *delta*
-relative to ``p0``, so engaging with a steady controller does not move the arm. On the latching
-frame ``p_ctrl == p0``, so the emitted position is exactly the home (no jump). The last pose is
-held on a dropped frame.
+first ``RUNNING`` frame (the headset "Play"). From then on the EE position is driven by the
+*delta* relative to ``p0``, so engaging with a steady controller does not move the arm. On the
+latching frame ``p_ctrl == p0``, so the emitted position is exactly the home (no jump). The last
+pose is held on a dropped frame.
 
 The clutch keeps position-control IK (``use_relative_mode=False``): it emits an **absolute**
 target, just rebased.
 
-Frames and the live-EE home
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Frames and the home
+^^^^^^^^^^^^^^^^^^^^
 
-The controller delta ``(p_ctrl - p0)`` is in the (anchor-transformed) **world** frame, while the
-IK position command is in the robot **base** frame. When the base is not aligned with the world
-frame (e.g. a seated, yawed base) the world-frame delta is rotated into the base frame before
-being added to the home. The base placement is **not** hardcoded: the retargeter learns it at
-runtime from the optional ``robot_base_pos`` input (the live ``world_T_base`` 4x4 transform,
-supplied by the Isaac Lab ``IsaacTeleopDevice`` from its ``base_frame_prim_path``), latched on
-engage. When that input is absent the base frame defaults to **identity** -- world and base
-coincide and the delta is applied unrotated.
+The controller stream reaching the clutch is already expressed in the robot **base** frame: the
+Isaac Lab ``IsaacTeleopDevice`` rebases it upstream via its ``target_frame_prim_path`` (set to
+the robot base), composing ``base_T_world`` onto the XR anchor before the controllers are
+transformed. The clutch therefore applies the controller delta to the home directly, with no
+world->base rotation of its own, and needs **no** live end-effector or base feed.
 
-The ``home`` itself is latched on engage:
-
-* If the optional ``robot_ee_pos`` input (the live ``world_T_ee`` 4x4 transform, supplied by the
-  Isaac Lab ``IsaacTeleopDevice`` from its ``ee_frame_prim_path``) is connected, the home is the
-  robot's **current** end-effector position converted into the latched base frame -- so the arm
-  stays put on engage.
-* Otherwise it falls back to a fixed constant approximating the EE at the init joint pose.
+The ``home`` is the clutch's own running home: it is seeded on reset / first engage from the
+static ``home_base_T_ee`` reset-origin (the gripper's pose in the base frame at the reset pose,
+only its translation is used), and thereafter holds the last commanded pose so a mid-task
+re-clutch resumes from where the arm was left.
 
 .. note::
 
-   The fallback home and the sign/scale knobs carry ``TODO(verify-in-sim)`` markers: the rebasing
-   math is exact and unit-tested, but the end-to-end controller->EE handedness should be confirmed
-   in simulation. Because the base placement now arrives at runtime via ``robot_base_pos``, this
-   library no longer embeds any specific task's robot seat pose.
+   The fallback home, the position sign/scale knobs, and the orientation calibration offset
+   carry ``TODO(tune-in-sim)`` markers: the rebasing math is exact and unit-tested, but the
+   end-to-end controller->EE handedness and the neutral-controller -> neutral-gripper offset
+   should be confirmed in simulation.
 
-Wrist roll
-----------
+Orientation calibration
+-----------------------
 
-Because position-only IK drops the controller's orientation, ``SO101RollRetargeter`` recovers
-just the **roll** as a separate joint channel. It takes the swing-twist twist angle of the grip
-orientation about fixed world Z via quaternion projection (``2 * atan2(d, w)``), which stays
-well-conditioned near a 180-degree rotation where Euler/rotvec extraction is unstable.
-
-The twist responsiveness is exact and pose-independent, but the absolute zero absorbs the
-controller's world *yaw* -- acceptable for the seated, forward-facing stacking setup. Switching
-the twist axis to the grip body Z is the fix if yaw leak becomes objectionable.
+The clutch emits the controller grip orientation composed with a fixed calibration offset:
+``q_cmd = orientation_offset (x) q_grip`` (base-frame left multiply, renormalized). The offset
+defaults to identity (passthrough); a non-identity offset maps a neutrally-held controller to a
+sensible neutral gripper orientation for the SE3 IK. This single rotational offset replaces the
+per-DOF roll/pitch calibration hacks of earlier revisions.
 
 Gripper
 -------
@@ -114,7 +102,6 @@ Use it from Python
    from isaacteleop.retargeters import (
        SO101ClutchRetargeter,
        SO101GripperRetargeter,
-       SO101RollRetargeter,
        TensorReorderer,
    )
    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
@@ -124,43 +111,33 @@ Use it from Python
    def build_so101_stack_pipeline():
        controllers = ControllersSource(name="controllers")
        world_T_anchor = ValueInput("world_T_anchor", TransformMatrix())
-       ee_pos = ValueInput(SO101ClutchRetargeter.ROBOT_EE_POS_INPUT, TransformMatrix())
-       base_pos = ValueInput(SO101ClutchRetargeter.ROBOT_BASE_POS_INPUT, TransformMatrix())
+       # The device rebases controller poses into the robot base frame upstream via
+       # target_frame_prim_path, so the clutch needs no live EE / base feed.
        xformed = controllers.transformed(world_T_anchor.output(ValueInput.VALUE))
 
        clutch = SO101ClutchRetargeter(name="ee_pose", input_device=ControllersSource.RIGHT)
        connected_clutch = clutch.connect({
            ControllersSource.RIGHT: xformed.output(ControllersSource.RIGHT),
-           SO101ClutchRetargeter.ROBOT_EE_POS_INPUT: ee_pos.output(ValueInput.VALUE),
-           SO101ClutchRetargeter.ROBOT_BASE_POS_INPUT: base_pos.output(ValueInput.VALUE),
        })
-
-       roll = SO101RollRetargeter(name="roll", input_device=ControllersSource.RIGHT)
-       connected_roll = roll.connect(
-           {ControllersSource.RIGHT: xformed.output(ControllersSource.RIGHT)}
-       )
 
        gripper = SO101GripperRetargeter(name="gripper", input_device=ControllersSource.RIGHT)
        connected_gripper = gripper.connect(
            {ControllersSource.RIGHT: xformed.output(ControllersSource.RIGHT)}
        )
 
-       # Keep all 7 pose names in input_config (must match the retargeter's (7,) output), but
-       # drop the quaternion by listing only xyz + roll + gripper in output_order.
+       # Keep all 7 pose names and pass the full pose (xyz + quat) plus gripper through.
        ee_elements = ["pos_x", "pos_y", "pos_z", "quat_x", "quat_y", "quat_z", "quat_w"]
        reorderer = TensorReorderer(
            input_config={
                "ee_pose": ee_elements,
-               "roll_command": ["roll_value"],
                "gripper_command": ["gripper_value"],
            },
-           output_order=["pos_x", "pos_y", "pos_z", "roll_value", "gripper_value"],
+           output_order=ee_elements + ["gripper_value"],
            name="action_reorderer",
-           input_types={"ee_pose": "array", "roll_command": "scalar", "gripper_command": "scalar"},
+           input_types={"ee_pose": "array", "gripper_command": "scalar"},
        )
        connected = reorderer.connect({
            "ee_pose": connected_clutch.output("ee_pose"),
-           "roll_command": connected_roll.output("roll_command"),
            "gripper_command": connected_gripper.output("gripper_command"),
        })
        return OutputCombiner({"action": connected.output("output")})
@@ -171,7 +148,7 @@ See :ref:`isaac-teleop-pipeline-builder` for the general pipeline-builder patter
 Validate
 --------
 
-The retargeters ship with sim-free unit tests (trigger/roll/clutch math plus per-frame
+The retargeters ship with sim-free unit tests (trigger/clutch math plus per-frame
 ``compute`` behavior):
 
 .. code-block:: console

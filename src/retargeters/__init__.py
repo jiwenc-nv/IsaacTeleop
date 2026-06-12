@@ -17,8 +17,6 @@ Available Retargeters:
     - FootPedalRootCmdRetargeter: Root command from 3-axis foot pedal (horizontal/vertical + rudder)
     - GripperRetargeter: Pinch-based gripper control
     - SO101ClutchRetargeter: Clutch-rebased absolute EE pose for the SO-101 5-DOF arm
-    - SO101WristRetargeter: Engage-relative wrist roll + absolute pitch for the SO-101 5-DOF arm
-    - SO101RollRetargeter: Back-compat alias for SO101WristRetargeter
     - SO101GripperRetargeter: Proportional (analog) jaw closedness for the SO-101 gripper
     - SharpaHandRetargeter: Pinocchio/Pink IK-based retargeting for Sharpa hand
     - SharpaBiManualRetargeter: Bimanual version of SharpaHandRetargeter
@@ -102,14 +100,12 @@ _LAZY_IMPORTS: dict[str, tuple[str, str, str | None]] = {
     # .gripper_retargeter
     "GripperRetargeter": (".gripper_retargeter", "GripperRetargeter", None),
     "GripperRetargeterConfig": (".gripper_retargeter", "GripperRetargeterConfig", None),
-    # .SO101 (SO-101 5-DOF arm: clutch EE pose, wrist roll+pitch, analog gripper)
+    # .SO101 (SO-101 5-DOF arm: full-pose clutch EE pose, analog gripper)
     "SO101ClutchRetargeter": (
         ".SO101.clutch_retargeter",
         "SO101ClutchRetargeter",
         None,
     ),
-    "SO101WristRetargeter": (".SO101.wrist_retargeter", "SO101WristRetargeter", None),
-    "SO101RollRetargeter": (".SO101.wrist_retargeter", "SO101RollRetargeter", None),
     "SO101GripperRetargeter": (
         ".SO101.gripper_retargeter",
         "SO101GripperRetargeter",
@@ -208,8 +204,6 @@ __all__ = [
     "GripperRetargeterConfig",
     # SO-101 5-DOF arm retargeters
     "SO101ClutchRetargeter",
-    "SO101WristRetargeter",
-    "SO101RollRetargeter",
     "SO101GripperRetargeter",
     "Se3AbsRetargeter",
     "Se3RelRetargeter",

@@ -13,9 +13,9 @@ the *delta* relative to that captured origin, while keeping position-control IK
 :class:`SO101ClutchRetargeter` therefore emits an **absolute** 7D ``ee_pose`` (position
 ``[x, y, z]`` [m] + orientation quaternion ``[x, y, z, w]``) with the exact same output
 contract as :class:`~isaacteleop.retargeters.Se3AbsRetargeter` (node ``name="ee_pose"``, output
-key ``"ee_pose"``, ``NDArrayType("pose", shape=(7,))``), so the downstream reorderer and 5D
-action contract are untouched. The orientation is a passthrough of the controller grip
-orientation and is dropped downstream (position-only IK).
+key ``"ee_pose"``, ``NDArrayType("pose", shape=(7,))``), so the downstream reorderer and the
+8D action contract are untouched. The orientation is the controller grip orientation composed
+with a fixed calibration offset; it **drives the SE3 IK** that solves all 5 SO-101 arm joints.
 
 Frame contract: the controller stream reaching this retargeter is already expressed in the
 robot **base** frame -- the Isaac Lab device rebases it upstream via its
@@ -50,9 +50,9 @@ Clutch behavior:
   pose. An explicit **reset** re-seeds the home from the configured reset-origin for a fresh
   episode.
 - The reset-origin home is supplied as a ``base_T_ee`` 4x4 transform at construction; only its
-  translation drives the position command (the orientation channel is a controller passthrough,
-  dropped by position-only IK). It is **never** ``(0, 0, 0)`` (that would command the EE into the
-  robot base / floor).
+  translation drives the position command (the orientation is the live controller grip
+  orientation composed with the fixed calibration offset, not read from this home transform). It
+  is **never** ``(0, 0, 0)`` (that would command the EE into the robot base / floor).
 - The last pose is held on a dropped frame.
 """
 
@@ -86,6 +86,37 @@ _CLUTCH_HOME_EE_POS: tuple[float, float, float] = (0.22, 0.0, 0.12)
 _CLUTCH_POSITION_SCALE = 1.0
 # Identity orientation quaternion [x, y, z, w], emitted before any valid frame / on reset.
 _IDENTITY_QUAT = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+# Default fixed orientation calibration offset [x, y, z, w], right-multiplied (body frame) onto
+# the controller grip orientation so a neutrally-held controller maps to a sensible neutral
+# gripper orientation. The OpenXR grip frame and the SO-101 gripper_link frame share their tool
+# axis (both point/approach along their own -Z), so the only fixed convention offset between them
+# is a roll about that shared approach (Z) axis; the default is Rz(pi) == [0, 0, 1, 0] (xyzw), the
+# body-frame equivalent of the ~pi wrist-roll calibration the deleted SO101WristRetargeter applied.
+# TODO(tune-in-sim): confirm the angle/sign (pi vs pi +/- pi/2) -- it sets which way the single
+# moving jaw faces relative to the hand.
+_DEFAULT_ORIENTATION_OFFSET = np.array(
+    [0.0, 0.0, 1.0, 0.0], dtype=np.float64
+)  # Rz(pi), xyzw
+
+
+def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product ``a (x) b`` of two ``[x, y, z, w]`` quaternions (scalar-last).
+
+    Follows the SciPy ``Rotation`` composition convention (``(Ra * Rb).as_quat()`` equals
+    ``_quat_mul(Ra.as_quat(), Rb.as_quat())``), but is inlined here to avoid a SciPy /
+    cross-module dependency for this single product.
+    """
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return np.array(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ],
+        dtype=np.float64,
+    )
 
 
 def _rebased_position(
@@ -127,8 +158,10 @@ class SO101ClutchRetargeter(BaseRetargeter):
     engage. The controller stream is already in the robot base frame (rebased upstream by the
     Lab device's ``target_frame_prim_path``), so no world->base rotation is applied here. This
     keeps position-control IK (``use_relative_mode=False``) while avoiding an engage-time
-    teleport (see the module docstring). The orientation is a passthrough and dropped
-    downstream.
+    teleport (see the module docstring). The orientation drives the SE3 IK: it is the controller
+    grip orientation right-multiplied (body frame) by the fixed :paramref:`orientation_offset`
+    calibration rotation, then renormalized -- a rigid "tool mount" between the controller grip
+    frame and the gripper, so a controller rotation maps 1:1 onto the gripper.
 
     The clutch keeps its own running home: on a mid-task re-clutch it latches the home to the
     last EE pose it commanded, so it resumes from where the arm was left (no jump). On reset /
@@ -142,6 +175,8 @@ class SO101ClutchRetargeter(BaseRetargeter):
         name: str,
         input_device: str = ControllersSource.RIGHT,
         home_base_T_ee: np.ndarray | None = None,
+        orientation_offset: np.ndarray | None = None,
+        debug_log_engage: bool = False,
     ) -> None:
         """Initialize the clutch EE-pose retargeter.
 
@@ -151,12 +186,31 @@ class SO101ClutchRetargeter(BaseRetargeter):
             home_base_T_ee: Optional ``base_T_ee`` 4x4 reset-origin home transform [m] giving the
                 EE pose in the robot base frame at the reset pose. The clutch seeds its home from
                 this on reset / first engage, so the owning task must reset the arm to this pose to
-                avoid a jump on engage. Only its translation block drives the position command
-                (orientation is a controller passthrough, dropped by position-only IK). When
-                ``None``, falls back to :data:`_CLUTCH_HOME_EE_POS`.
+                avoid a jump on engage. Only its translation block drives the position command (the
+                orientation is the live controller grip orientation composed with
+                :paramref:`orientation_offset`, not read from this transform). When ``None``, falls
+                back to :data:`_CLUTCH_HOME_EE_POS`.
+            orientation_offset: Optional fixed calibration quaternion ``[x, y, z, w]``
+                right-multiplied (body frame) onto the controller grip orientation
+                (``q_cmd = q_grip (x) offset``) so a neutrally-held controller maps to a neutral
+                gripper orientation for the SE3 IK; a controller rotation then maps 1:1 onto the
+                gripper. When ``None``, defaults to a roll of ``pi`` about the approach axis
+                (``Rz(pi)``); see :data:`_DEFAULT_ORIENTATION_OFFSET`.
+            debug_log_engage: When ``True``, prints the controller grip orientation (xyzw, base
+                frame) and the active offset on each engage, to capture the calibration offset
+                ``R_off = quat_inv(q_grip) (x) q_G0``. Leave ``False`` outside tuning sessions.
         """
         self._input_device = input_device
         super().__init__(name=name)
+        # Fixed calibration offset [x, y, z, w], right-multiplied (body frame) onto the grip
+        # orientation before it is emitted. Defaults to Rz(pi) about the approach axis.
+        if orientation_offset is None:
+            self._orientation_offset = _DEFAULT_ORIENTATION_OFFSET.copy()
+        else:
+            self._orientation_offset = np.asarray(
+                orientation_offset, dtype=np.float64
+            ).copy()
+        self._debug_log_engage = bool(debug_log_engage)
         # Reset-origin home [m] in the base frame: the translation of the ``base_T_ee`` transform,
         # or the constant. Seeds the home on reset / first engage.
         if home_base_T_ee is None:
@@ -224,8 +278,14 @@ class SO101ClutchRetargeter(BaseRetargeter):
             np.float64
         )
         grip_ori = np.from_dlpack(inp[ControllerInputIndex.GRIP_ORIENTATION]).astype(
-            np.float32
+            np.float64
         )  # XYZW
+        # Compose the fixed calibration offset as a body-frame right multiply (q_grip (x) offset)
+        # and renormalize, so a controller rotation maps 1:1 onto the commanded gripper orientation
+        # that drives the SE3 IK.
+        cmd_ori = _quat_mul(grip_ori, self._orientation_offset)
+        cmd_ori = cmd_ori / np.linalg.norm(cmd_ori)
+        cmd_ori = cmd_ori.astype(np.float32)
 
         if self._origin is None:
             if not running:
@@ -241,9 +301,21 @@ class SO101ClutchRetargeter(BaseRetargeter):
                 self._home = self._home_config.copy()
             else:
                 self._home = self._last_pose[:3].astype(np.float64)
+            if self._debug_log_engage:
+                # Tuning aid: capture the controller orientation at engage so the calibration
+                # offset can be set to R_off = quat_inv(q_grip) (x) q_G0. q_G0 is the gripper_link
+                # orientation in the base frame at the reset pose -- read it once (it is constant)
+                # from the env's "ee_frame" FrameTransformer: scene["ee_frame"].data
+                # .target_quat_source[0, 0] (wxyz -> reorder to xyzw before composing R_off).
+                print(
+                    "[SO101ClutchRetargeter] engage capture (xyzw):\n"
+                    f"  q_grip (controller, base frame) = {grip_ori.tolist()}\n"
+                    f"  orientation_offset              = {self._orientation_offset.tolist()}\n"
+                    f"  emitted cmd_ori                 = {cmd_ori.tolist()}"
+                )
 
         pos = _rebased_position(
             grip_pos, self._origin, self._home, _CLUTCH_POSITION_SCALE
         )
-        self._last_pose = np.concatenate([pos, grip_ori]).astype(np.float32)
+        self._last_pose = np.concatenate([pos, cmd_ori]).astype(np.float32)
         ee_pose[0] = self._last_pose
