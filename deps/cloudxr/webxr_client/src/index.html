@@ -137,6 +137,55 @@ limitations under the License.
             color: #999;
         }
 
+        /* Server IP field paired with an inline clear ("x") button */
+        .input-with-clear {
+            position: relative;
+        }
+
+        .input-with-clear .ui-input {
+            /* leave room so the IP text never sits under the clear button */
+            padding-right: 44px;
+        }
+
+        .input-clear-btn {
+            position: absolute;
+            /* center on the 48px-tall input, ignoring its 16px margin-bottom */
+            top: 24px;
+            right: 8px;
+            transform: translateY(-50%);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            /* equal width/height + override the global button min-height so the
+               hover highlight is a circle, not a tall pill */
+            width: 28px;
+            height: 28px;
+            min-height: 0;
+            padding: 0;
+            border: none;
+            border-radius: 50%;
+            background: transparent;
+            color: #999;
+            font-size: 1.25rem;
+            line-height: 1;
+            cursor: pointer;
+        }
+
+        /* Shown only while the field has a value (toggled in CloudXR2DUI) */
+        .input-clear-btn.visible {
+            display: flex;
+        }
+
+        .input-clear-btn:hover {
+            background: rgba(0, 0, 0, 0.08);
+            color: var(--text-main);
+        }
+
+        .input-clear-btn:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(118, 185, 0, 0.2);
+        }
+
         .settings-table {
             width: 100%;
             margin-bottom: 24px;
@@ -609,8 +658,12 @@ limitations under the License.
 
                     <div id="manualFields">
                         <label for="serverIpInput" class="input-label">Server IP</label>
-                        <input id="serverIpInput" class="ui-input" type="text" placeholder="Server IP (default: page URL hostname)"
-                            spellcheck="false" autocapitalize="off">
+                        <div class="input-with-clear">
+                            <input id="serverIpInput" class="ui-input" type="text" placeholder="Server IP (default: page URL hostname)"
+                                spellcheck="false" autocapitalize="off">
+                            <button id="serverIpClearButton" type="button" class="input-clear-btn"
+                                aria-label="Clear server IP" title="Clear server IP"><span aria-hidden="true">&times;</span></button>
+                        </div>
                         <label for="portInput" class="input-label">Port</label>
                         <input id="portInput" class="ui-input" type="number" placeholder="Port (default: 49100)"
                             spellcheck="false" min="1" max="65535">

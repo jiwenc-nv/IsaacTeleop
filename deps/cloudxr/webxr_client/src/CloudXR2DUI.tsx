@@ -82,6 +82,8 @@ export class CloudXR2DUI {
   private startButton!: HTMLButtonElement;
   /** Input field for the CloudXR server IP address */
   private serverIpInput!: HTMLInputElement;
+  /** Button to clear the prefilled server IP (re-enables the browser autocomplete dropdown) */
+  private serverIpClearButton!: HTMLButtonElement;
   /** Input field for the CloudXR server port number */
   private portInput!: HTMLInputElement;
   /** Input field for proxy URL configuration */
@@ -359,6 +361,7 @@ export class CloudXR2DUI {
   private initializeElements(): void {
     this.startButton = this.getElement<HTMLButtonElement>('startButton');
     this.serverIpInput = this.getElement<HTMLInputElement>('serverIpInput');
+    this.serverIpClearButton = this.getElement<HTMLButtonElement>('serverIpClearButton');
     this.portInput = this.getElement<HTMLInputElement>('portInput');
     this.proxyUrlInput = this.getElement<HTMLInputElement>('proxyUrl');
     this.immersiveSelect = this.getElement<HTMLSelectElement>('immersive');
@@ -545,6 +548,24 @@ export class CloudXR2DUI {
     addListener(this.serverTypeSelect, 'change', updateConfig);
     addListener(this.serverIpInput, 'input', updateConfig);
     addListener(this.serverIpInput, 'change', updateConfig);
+
+    // Show the clear ("x") button only while the server IP field has a value,
+    // and clear the prefill (incl. localStorage) on click so the browser's
+    // autocomplete dropdown of previously connected servers can show again.
+    const updateServerIpClearButton = () => {
+      this.serverIpClearButton.classList.toggle('visible', this.serverIpInput.value.length > 0);
+    };
+    addListener(this.serverIpInput, 'input', updateServerIpClearButton);
+    addListener(this.serverIpClearButton, 'click', () => {
+      this.serverIpInput.value = '';
+      // Update the live config + clear-button state directly; 'change' persists
+      // the now-empty value via the enableLocalStorage handler.
+      updateServerIpClearButton();
+      updateConfig();
+      this.serverIpInput.dispatchEvent(new Event('change', { bubbles: true }));
+      this.serverIpInput.focus();
+    });
+    updateServerIpClearButton();
     addListener(this.portInput, 'input', updateConfig);
     addListener(this.portInput, 'change', updateConfig);
     const updateResValidation = () => this.updateResolutionValidationMessage();
