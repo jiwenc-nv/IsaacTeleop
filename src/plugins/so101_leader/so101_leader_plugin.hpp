@@ -56,12 +56,15 @@ public:
     void update();
 
 private:
-    //! Per-joint mapping from a FEETECH servo to a joint angle, mirroring LeRobot's calibration:
-    //! ``angle [rad] = sign * (clamp(ticks, range_min, range_max) - home_ticks) * 2*pi / 4096``.
+    //! Per-joint mapping from a FEETECH servo to a joint angle, mirroring LeRobot's calibration. The
+    //! five revolute joints use ``angle [rad] = sign * (clamp(ticks, range_min, range_max) -
+    //! home_ticks) * 2*pi / 4096`` (LeRobot DEGREES, midpoint-centered). The gripper instead maps its
+    //! calibrated tick range affinely onto the URDF gripper limits (LeRobot RANGE_0_100); see
+    //! gripper_tick_to_angle(). ``home_ticks`` is unused for the gripper.
     struct JointCalibration
     {
         uint8_t servo_id;
-        double sign; // +1 / -1 (LeRobot drive_mode)
+        double sign; // +1 / -1 (LeRobot drive_mode); for the gripper, -1 flips the open/closed end
         int home_ticks; // raw tick at the joint's zero pose (LeRobot homing reference); 2048 = servo center
         int range_min; // sweep min tick; reads are clamped to [range_min, range_max]
         int range_max; // sweep max tick; default full range 0..4095 => clamp is a no-op
@@ -71,6 +74,11 @@ private:
     void read_hardware();
     //! Synthetic smooth trajectory used when no serial device is attached.
     void read_synthetic();
+    //! Map a (clamped) gripper servo tick onto the URDF gripper joint range. The gripper is a
+    //! parallel jaw normalized as a fraction of its calibrated travel (LeRobot RANGE_0_100), then
+    //! scaled to the URDF limits -- not mirrored 1:1 as a revolute angle. ``sign < 0`` flips the
+    //! open/closed end (LeRobot's gripper drive_mode); ``home_ticks`` is unused.
+    double gripper_tick_to_angle(int ticks) const;
     void push_current_state();
     //! Load calibration from @p path. A ``.json`` file is read as a LeRobot calibration (see
     //! load_lerobot_calibration()); anything else is the plain-text format: ``name servo_id sign
@@ -78,7 +86,8 @@ private:
     //! Unknown joint names are ignored; missing joints keep defaults.
     void load_calibration(const std::string& path);
     //! Load a LeRobot calibration JSON. Maps ``range_min/range_max`` -> range, the range midpoint ->
-    //! ``home_ticks`` (LeRobot's zero), and ``drive_mode`` -> ``sign``. The per-joint
+    //! ``home_ticks`` (LeRobot's zero for the revolute joints; unused for the gripper, which is
+    //! remapped by gripper_tick_to_angle()), and ``drive_mode`` -> ``sign``. The per-joint
     //! ``homing_offset`` is reconciled against the servo by compensate_homing().
     void load_lerobot_calibration(const std::string& path);
     //! Reconcile a loaded LeRobot calibration with the live servos: LeRobot's offsets live in the

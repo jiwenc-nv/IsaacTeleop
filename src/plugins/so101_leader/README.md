@@ -16,6 +16,9 @@ SMS/STS wire protocol directly — no SDK dependency — and implements just wha
 disable torque so the arm can be back-driven by hand, then read `Present_Position` (register 56,
 4096 ticks / 360°) for all six servos in a **single SYNC READ** per frame (one bus round-trip, not
 six — matching LeRobot's `sync_read`). Ticks are converted to radians with per-joint calibration.
+The five revolute joints are mirrored 1:1 (midpoint-centered, like LeRobot's `DEGREES`); the
+**gripper** is a parallel jaw, so its calibrated tick range is mapped affinely onto the URDF gripper
+joint limits (like LeRobot's `RANGE_0_100`), not treated as a centered angle.
 
 When no serial device is given, the plugin falls back to a **synthetic** trajectory so the
 device → tracker → retargeter pipeline runs with no hardware (CI and the headless example).
@@ -60,8 +63,11 @@ It disables torque, then:
    `range_min`/`range_max` until you press ENTER.
 
 It writes the file (plain text, or LeRobot JSON if the path ends in `.json`; all `sign` default to
-`+1` — flip any inverted joint by hand) and prints the gripper's range endpoints in radians, which
-you drop into the retargeter's `gripper_open`/`gripper_close`.
+`+1` — flip any inverted joint by hand) and prints the gripper mapping: `range_min → open`,
+`range_max → closed` on the URDF gripper limits (`drive_mode 0`; set `drive_mode 1` if your trigger
+sweeps the other way). For **EE (`ee_pose`) mode** set the retargeter's
+`gripper_open`/`gripper_close` to those URDF limits (`+1.74533` / `−0.174533`); **joint mode** needs
+nothing, since the gripper is already streamed in URDF radians.
 
 ### LeRobot calibration interoperability
 
@@ -81,7 +87,10 @@ Mapping: LeRobot's `range_min`/`range_max` → our range (reads are clamped to i
 in the **servo EEPROM** (its runtime normalization doesn't use it), so on connect we read the
 servo's live `Homing_Offset` (register 31) and shift home/range by
 `homing_offset_file − homing_offset_servo` — reconciling the frames without writing to the servo.
-The result reproduces LeRobot's joint angles (in radians rather than degrees).
+The result reproduces LeRobot's joint angles (in radians rather than degrees) for the five revolute
+joints. The **gripper** is the one exception: LeRobot emits `RANGE_0_100` there, whereas this plugin
+maps the same calibrated travel onto the URDF gripper limits (`[−0.174533, 1.74533]` rad) so the
+joint-space consumer gets a sim-frame jaw angle; `drive_mode` selects which end is open.
 
 ### Hardware setup (per SO-ARM100 / LeRobot)
 
@@ -97,8 +106,11 @@ The result reproduces LeRobot's joint angles (in radians rather than degrees).
 The plain-text format (used unless the path ends in `.json`) is whitespace-separated, one joint per
 line; `#` starts a comment. Columns:
 `name  servo_id  sign(+1/-1)  home_ticks(0..4095)  [range_min range_max]` (the two range columns are
-optional). The conversion is
-`angle [rad] = sign * (clamp(ticks, range_min, range_max) - home_ticks) * 2π / 4096`.
+optional). For the five revolute joints the conversion is
+`angle [rad] = sign * (clamp(ticks, range_min, range_max) - home_ticks) * 2π / 4096`. The **gripper**
+ignores `home_ticks` and instead maps `[range_min, range_max]` affinely onto the URDF gripper limits
+(`range_min → 1.74533` open, `range_max → -0.174533` closed; `sign -1` swaps the ends), so calibrate
+its range.
 
 ```
 # name           id  sign  home_ticks  range_min  range_max

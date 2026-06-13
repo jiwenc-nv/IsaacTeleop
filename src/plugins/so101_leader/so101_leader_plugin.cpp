@@ -48,6 +48,19 @@ constexpr std::array<const char*, kNumJoints> kJointNames = { "shoulder_pan", "s
 constexpr double kTicksToRadians = 2.0 * std::numbers::pi / 4096.0;
 constexpr int kFeetechBaud = 1000000; // STS factory default
 
+// The gripper is the last DOF. Unlike the five revolute joints (which we mirror 1:1 as
+// midpoint-centered angles), the gripper is a parallel jaw: LeRobot normalizes it as a fraction of
+// its calibrated travel (MotorNormMode.RANGE_0_100), NOT a centered angle, and the leader trigger's
+// mechanical sweep is neither centered on its midpoint nor equal in span to the sim joint. So we map
+// the calibrated tick range affinely onto the URDF gripper joint limits instead (see
+// gripper_tick_to_angle()).
+constexpr int kGripperIndex = kNumJoints - 1;
+// SO-101 gripper joint limits from Simulation/SO101/so101_new_calib.urdf (<joint name="gripper">).
+// On the leader the servo tick rises as the trigger closes, so with drive_mode 0 range_min is the
+// open end and range_max the closed end (set drive_mode 1 to swap). See gripper_tick_to_angle().
+constexpr double kGripperUrdfClosed = -0.174533; // [rad] fully-closed jaw (URDF lower); range_max end
+constexpr double kGripperUrdfOpen = 1.74533; // [rad] fully-open jaw (URDF upper); range_min end
+
 constexpr double kSynthAmplitude = 0.6; // [rad] arm-joint motion amplitude for the synthetic signal
 constexpr double kSynthPeriodFrames = 90.0; // one cycle per ~1 s at 90 Hz
 
@@ -224,8 +237,9 @@ void So101LeaderPlugin::load_lerobot_calibration(const std::string& path)
         const bool inverted = get("drive_mode", 0) != 0;
         const int range_min = static_cast<int>(get("range_min", 0));
         const int range_max = static_cast<int>(get("range_max", 4095));
-        // LeRobot's zero is the range midpoint (its DEGREES normalization centers on it); homing_offset
-        // lives in the servo and is reconciled in compensate_homing().
+        // For the revolute joints LeRobot's zero is the range midpoint (its DEGREES normalization
+        // centers on it); homing_offset lives in the servo and is reconciled in compensate_homing().
+        // home is unused for the gripper, which is remapped by gripper_tick_to_angle() instead.
         const int home = (range_min + range_max) / 2;
         calibration_[idx] =
             JointCalibration{ static_cast<uint8_t>(servo_id), inverted ? -1.0 : 1.0, home, range_min, range_max };
@@ -257,6 +271,24 @@ void So101LeaderPlugin::compensate_homing()
     }
 }
 
+double So101LeaderPlugin::gripper_tick_to_angle(int ticks) const
+{
+    // Affine remap of the calibrated tick travel onto the URDF gripper joint range -- the same shape
+    // as LeRobot's RANGE_0_100 (fraction of [range_min, range_max]) composed with the sim joint
+    // limits. ``home_ticks`` is intentionally unused for the gripper. On the SO-101 leader the servo
+    // tick rises as the trigger *closes*, so range_min is the open end and range_max the closed end;
+    // ``sign < 0`` (LeRobot drive_mode) flips that, mirroring LeRobot's ``100 - norm`` inversion.
+    const JointCalibration& c = calibration_[kGripperIndex];
+    const double span = static_cast<double>(c.range_max - c.range_min);
+    double frac = span != 0.0 ? (ticks - c.range_min) / span : 0.0;
+    frac = std::clamp(frac, 0.0, 1.0);
+    if (c.sign < 0.0)
+    {
+        frac = 1.0 - frac;
+    }
+    return kGripperUrdfOpen + frac * (kGripperUrdfClosed - kGripperUrdfOpen);
+}
+
 void So101LeaderPlugin::read_synthetic()
 {
     // Smooth, phase-shifted trajectory so the full device -> tracker -> retargeter path can run
@@ -266,8 +298,10 @@ void So101LeaderPlugin::read_synthetic()
     {
         positions_[i] = kSynthAmplitude * std::sin(phase + 0.5 * static_cast<double>(i));
     }
-    // Gripper: normalized open/close oscillation in [0, 1].
-    positions_[kNumJoints - 1] = 0.5 * (1.0 + std::sin(phase));
+    // Gripper: oscillate across the URDF gripper joint range (closed <-> open), matching the
+    // hardware path's units so the synthetic stream exercises the same downstream mapping.
+    const double frac = 0.5 * (1.0 + std::sin(phase)); // [0, 1]
+    positions_[kGripperIndex] = kGripperUrdfClosed + frac * (kGripperUrdfOpen - kGripperUrdfClosed);
 }
 
 void So101LeaderPlugin::read_hardware()
@@ -285,7 +319,10 @@ void So101LeaderPlugin::read_hardware()
         {
             const int ticks =
                 std::clamp(static_cast<int>(read_ticks_[i]), calibration_[i].range_min, calibration_[i].range_max);
-            positions_[i] = calibration_[i].sign * (ticks - calibration_[i].home_ticks) * kTicksToRadians;
+            // The gripper is a parallel jaw mapped onto the URDF joint range, not a revolute mirror.
+            positions_[i] = (i == kGripperIndex) ?
+                                gripper_tick_to_angle(ticks) :
+                                calibration_[i].sign * (ticks - calibration_[i].home_ticks) * kTicksToRadians;
         }
     }
 }
@@ -444,13 +481,15 @@ int run_calibration(const std::string& device_path, const std::string& output_pa
                   << "  range=[" << range_min[i] << ", " << range_max[i] << "]" << std::endl;
     }
 
-    // Gripper endpoints in radians (relative to home) for the retargeter's gripper_open/gripper_close.
+    // The gripper streams in URDF joint radians: gripper_tick_to_angle() maps the swept tick range
+    // [range_min, range_max] affinely onto the URDF limits, so range_min -> open and range_max ->
+    // closed (drive_mode 0; flip with drive_mode 1 if your trigger sweeps the other way). For ee_pose
+    // mode set the retargeter's gripper_open/gripper_close to the URDF open/closed limits below.
     const int g = kNumJoints - 1;
-    const double grip_lo = (range_min[g] - home[g]) * kTicksToRadians;
-    const double grip_hi = (range_max[g] - home[g]) * kTicksToRadians;
-    std::cout << "\nGripper '" << kJointNames[g] << "' range endpoints (radians, relative to home): " << grip_lo
-              << " .. " << grip_hi << "\n  -> set JointStateRetargeterConfig.gripper_open / gripper_close to these "
-              << "(whichever matches your open/closed convention)." << std::endl;
+    std::cout << "\nGripper '" << kJointNames[g] << "': range_min " << range_min[g] << " -> open (" << kGripperUrdfOpen
+              << " rad), range_max " << range_max[g] << " -> closed (" << kGripperUrdfClosed
+              << " rad).\n  -> for ee_pose mode set JointStateRetargeterConfig.gripper_open=" << kGripperUrdfOpen
+              << ", gripper_close=" << kGripperUrdfClosed << " (joint mode needs nothing)." << std::endl;
 
     if (!output_path.empty())
     {
