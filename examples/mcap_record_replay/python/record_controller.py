@@ -4,23 +4,26 @@
 """
 Record a live OpenXR controller-tracking session to an MCAP file.
 
-Requires an active OpenXR runtime / headset. The pipeline in ``common.py``
-wires only ``ControllersSource``, so ``TeleopSession`` records exactly the
-``controllers`` channel — no head, no hands.
+``CloudXRLauncher`` starts the CloudXR runtime and WSS proxy automatically —
+no separate terminal or pre-running headset daemon is needed. The pipeline in
+``common.py`` wires only ``ControllersSource``, so ``TeleopSession`` records
+exactly the ``controllers`` channel — no head, no hands.
 
 Usage:
-    python record_controller.py [duration_seconds] [output.mcap]
+    python record_controller.py [duration_seconds] [output.mcap] [--accept-eula]
 
 Defaults: 5 seconds → ../recordings/controllers_<timestamp>.mcap
 
 See: https://nvidia.github.io/IsaacTeleop/main/references/mcap_record_replay.html
 """
 
+import argparse
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
+from isaacteleop.cloudxr import CloudXRLauncher
 from isaacteleop.deviceio import McapRecordingConfig
 from isaacteleop.retargeting_engine.tensor_types.indices import ControllerInputIndex
 from isaacteleop.teleop_session_manager import TeleopSession, TeleopSessionConfig
@@ -29,10 +32,27 @@ from common import build_controller_pipeline
 
 
 def main(argv: list[str]) -> int:
-    duration_s = float(argv[1]) if len(argv) > 1 else 5.0
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "duration", nargs="?", type=float, default=5.0, help="Recording duration (s)"
+    )
+    parser.add_argument("output", nargs="?", help="Output .mcap path")
+    parser.add_argument(
+        "--accept-eula",
+        action="store_true",
+        help="Accept the NVIDIA CloudXR EULA non-interactively",
+    )
+    parser.add_argument(
+        "--install-dir",
+        default="~/.cloudxr",
+        help="CloudXR install directory (default: ~/.cloudxr)",
+    )
+    args = parser.parse_args(argv[1:])
 
-    if len(argv) > 2:
-        mcap_path = Path(argv[2])
+    duration_s: float = args.duration
+
+    if args.output:
+        mcap_path = Path(args.output)
         mcap_path.parent.mkdir(parents=True, exist_ok=True)
     else:
         out_dir = Path(__file__).resolve().parent.parent / "recordings"
@@ -47,25 +67,30 @@ def main(argv: list[str]) -> int:
         mcap_config=McapRecordingConfig(str(mcap_path)),
     )
 
-    with TeleopSession(config) as session:
-        start = time.time()
-        while time.time() - start < duration_s:
-            result = session.step()
-            if session.frame_count % 60 == 0:
-                left_ctrl = result["controller_left"]
-                right_ctrl = result["controller_right"]
-                left = not left_ctrl.is_none and bool(
-                    left_ctrl[ControllerInputIndex.AIM_IS_VALID]
-                )
-                right = not right_ctrl.is_none and bool(
-                    right_ctrl[ControllerInputIndex.AIM_IS_VALID]
-                )
-                print(
-                    f"[record] t={time.time() - start:5.2f}s  "
-                    f"frame={session.frame_count}  L={'Y' if left else '-'} "
-                    f"R={'Y' if right else '-'}"
-                )
-            time.sleep(1 / 60)
+    with CloudXRLauncher(
+        install_dir=args.install_dir,
+        accept_eula=args.accept_eula,
+    ) as launcher:
+        print(f"[record] CloudXR runtime started (WSS log: {launcher.wss_log_path})")
+        with TeleopSession(config) as session:
+            start = time.time()
+            while time.time() - start < duration_s:
+                result = session.step()
+                if session.frame_count % 60 == 0:
+                    left_ctrl = result["controller_left"]
+                    right_ctrl = result["controller_right"]
+                    left = not left_ctrl.is_none and bool(
+                        left_ctrl[ControllerInputIndex.AIM_IS_VALID]
+                    )
+                    right = not right_ctrl.is_none and bool(
+                        right_ctrl[ControllerInputIndex.AIM_IS_VALID]
+                    )
+                    print(
+                        f"[record] t={time.time() - start:5.2f}s  "
+                        f"frame={session.frame_count}  L={'Y' if left else '-'} "
+                        f"R={'Y' if right else '-'}"
+                    )
+                time.sleep(1 / 60)
 
     print(f"[record] done — {mcap_path}")
     return 0
