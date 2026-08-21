@@ -12,15 +12,15 @@ SO-101 **leader gripper** that replaces it once the clutch engages.
 Single process, single thread, **one** OpenXR session:
 
 ```
-VizSession(kXr)  ──get_oxr_handles()──▶  TeleopSession
+XrTwinSession    ──oxr_handles()────▶  TeleopSession
      │                                        │
      │ recommended resolution                 │ EePoseRateLimiter output
      ▼                                        ▼
 mjr_render ─blit─▶ flip + depth-invert ─glReadPixels─▶ PBO ═CUDA═▶ submit()
 ```
 
-That is the thesis: `VizSession` (rendering) and `TeleopSession` (input) share
-one OpenXR session via `get_oxr_handles()`, and **MuJoCo's own renderer**
+That is the thesis: `isaacteleop.viz.robot.XrTwinSession` (rendering) and
+`TeleopSession` (input) share one OpenXR session via its `oxr_handles()`, and **MuJoCo's own renderer**
 reaches `ProjectionLayer.submit()` by CUDA pointer with no copy through host
 memory. Nothing else in this repository does that.
 
@@ -114,7 +114,7 @@ of how a hand holds a tool, taken on a headset and checkable nowhere else. See
 **This example is its own wheel, and the wheel is the only way to run it.**
 
 ```bash
-uv pip install "isaacteleop[cloudxr]" --find-links=./install/wheels/   # THIS checkout, not PyPI
+uv pip install "isaacteleop[cloudxr,robot-viz]" --find-links=./install/wheels/  # THIS checkout, not PyPI
 uv pip install ./examples/mujoco_xr                                    # same environment
 python -m isaacteleop_examples.mujoco_xr                               # needs a headset
 ```
@@ -178,7 +178,7 @@ cmake --preset py3.12 -DBUILD_VIZ=ON
 
 # 2. Install mujoco into the interpreter configure just created. `python -m pip`
 #    does not work: that venv has no pip.
-uv pip install --python build/cmake-cpython-312/teleop_build_venv/bin/python "mujoco==3.11.0"
+uv pip install --python build/cmake-cpython-312/teleop_build_venv/bin/python "mujoco==<the pin>"
 
 # 3. Re-configure. NOW the probe finds mujoco and the example is added.
 cmake --preset py3.12 -DBUILD_VIZ=ON
@@ -422,9 +422,9 @@ axis sits from horizontal at the posture held; the 27.88° there is a near-verti
 singularity reached only because that stand-in axis starts 43.7° up, and a real aim
 ray held level does not go near it. **That is an expectation, not a measurement** —
 the grip-to-aim transform is per-device and no headless test here can supply it, so
-re-measure the leak on a headset. `follower.yaw_of_axis` takes the axis as a
-**required** argument for exactly this reason; `follower.yaw_of` keeps `-Z` and is
-for the **head** alone, whose `-Z` genuinely is its view direction.
+re-measure the leak on a headset. `viz.robot.mj.yaw_of_axis` takes the axis as a
+**required** argument for exactly this reason; `viz.robot.mj.yaw_of` keeps `-Z` and
+is for the **head** alone, whose `-Z` genuinely is its view direction.
 
 **`_YAW_TRIM_DEG` should now be zero, and a session that needs a large one is
 evidence, not a knob.** Removing the offset is the whole reason for reading `aim`,
@@ -827,7 +827,7 @@ ctest --test-dir build/cmake-cpython-312 -L mujoco_xr --output-on-failure
 |---|---|
 | `test_frames.py` | the XR→MuJoCo axis map and quaternion order |
 | `test_projection.py` | the mjvGLCamera frustum (that it is the fov projected onto the near plane, and that the half-width is set so mjr_render's aspect fallback stays off) and the standard-Z depth contract |
-| `test_app_helpers.py` | the NaN-safe `dt` clamp, the zeroed-`predicted_display_time` guard, and that the first-frame frustum assertion passes on the real thing and fires on each way it can go wrong |
+| `test_app_helpers.py` | that the first-frame frustum assertion passes on the real thing and fires on each way it can go wrong. The `FrameInfo` adapters it used to cover -- the NaN-safe `dt` clamp, the zeroed-`predicted_display_time` guard -- moved to `src/viz/python_tests/test_robot_frame_info.py` with the code, alongside `test_robot_session.py` (frame-loop and teardown invariants) and `test_robot_mj.py` (yaw and anchoring) |
 | `test_readback.py` | **the GPU path**: that something is drawn at all, that row 0 is the top of the operator's view and the image is not mirrored, that the depth handed to `submit()` is standard Z with the background at exactly 1.0, and that the two eyes carry parallax of the right sign. Skips with a reason when there is no GPU |
 | `test_ghost.py` | the overlay: that the ghost is opaque, collision-free and carries no mass, that both its bodies are kinematic mocap bodies with no joint anywhere, that the four leader parts form one assembly with sub-mm gaps at the bolted joints and the servo seated in its bracket, that the print STLs are scaled from millimetres and the servo is not, that the ghost is *rigidly attached* to the grip frame whatever the calibration, that squeezing swings the trigger monotonically from the URDF joint's upper limit to its authored zero without driving the lever through the body, that the shipped `SO101GripperRetargeter` really is the thing driving that channel (built as a real pipeline and fed synthetic DeviceIO snapshots), and that an untracked controller freezes the whole gripper rather than parking it at the scene origin |
 

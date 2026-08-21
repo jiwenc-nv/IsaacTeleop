@@ -33,6 +33,7 @@ optional-dependencies.retargeters-lite = {file = ["requirements-retargeters-lite
 optional-dependencies.grounding = {file = ["requirements-grounding.txt"]}
 optional-dependencies.wuji = {file = ["requirements-wuji.txt"]}
 optional-dependencies.cloudxr = {file = ["requirements-cloudxr.txt"]}
+optional-dependencies.robot-viz = {file = ["requirements-robot-viz.txt"]}
 
 [tool.setuptools]
 include-package-data = false

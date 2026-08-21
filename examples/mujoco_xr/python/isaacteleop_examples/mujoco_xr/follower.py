@@ -20,6 +20,7 @@ import math
 import mujoco
 import numpy as np
 from isaacteleop.retargeters.rate_limiter import _quat_geodesic_angle
+from isaacteleop.viz.robot.mj import anchor_from_head, yaw_of_direction
 
 from . import _mujoco_xr
 
@@ -116,64 +117,6 @@ _ROTATION_ENTER_RAD = math.radians(20.0)
 _ROTATION_EXIT_RAD = math.radians(30.0)
 # Time the gate must stay inside the enter band before it goes green.
 _DWELL_S = 0.1
-
-
-def yaw_of_direction(forward_xr: np.ndarray, fallback_xr: np.ndarray) -> np.ndarray:
-    """The horizontal bearing of an XR direction, as a wxyz quaternion about +Y.
-
-    ``fallback_xr`` covers a direction within a hair of vertical, which has no bearing to
-    report. Every yaw reading goes through here, so all of them track a world-vertical
-    turn 1:1; what differs between callers is only what leaks in from the other two
-    degrees of freedom, which is a property of the axis they pick.
-    """
-    forward = np.asarray(forward_xr, dtype=float)
-    if abs(forward[0]) < 1e-6 and abs(forward[2]) < 1e-6:
-        # Straight up or down -- a headset face-down on a desk, a controller held
-        # muzzle-up. The fallback then points along the horizon: forwards when the
-        # direction points down, backwards when up.
-        forward = -math.copysign(1.0, forward[1]) * np.asarray(fallback_xr, dtype=float)
-
-    q_yaw = np.empty(4)
-    mujoco.mju_axisAngle2Quat(
-        q_yaw, np.array([0.0, 1.0, 0.0]), math.atan2(-forward[0], -forward[2])
-    )
-    return q_yaw
-
-
-def yaw_of_axis(q_xyzw: np.ndarray, forward_local: np.ndarray) -> np.ndarray:
-    """The horizontal facing of an XR orientation, as a wxyz quaternion about +Y.
-
-    ``forward_local`` names which axis of the pose is its facing, in the pose's own
-    frame. No default: each axis is blind to rotation about itself and sensitive to the
-    rest, so it must be chosen against the motions the reading has to ignore. See
-    app.py's _HAND_FORWARD_AXIS.
-    """
-    q_wxyz = np.asarray(q_xyzw, dtype=float)[[3, 0, 1, 2]]
-    forward = np.empty(3)
-    mujoco.mju_rotVecQuat(forward, np.asarray(forward_local, dtype=float), q_wxyz)
-    up = np.empty(3)
-    mujoco.mju_rotVecQuat(up, np.array([0.0, 1.0, 0.0]), q_wxyz)
-    return yaw_of_direction(forward, up)
-
-
-def yaw_of(q_xyzw: np.ndarray) -> np.ndarray:
-    """The horizontal facing of a HEAD pose, reading its -Z as the view direction."""
-    return yaw_of_axis(q_xyzw, np.array([0.0, 0.0, -1.0]))
-
-
-def anchor_from_head(head_pose_xr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Where the home grip goes and which way the arm faces, from a 7-D head pose.
-
-    Takes ``(position, xyzw)`` in XR; returns the XR home-grip position and the head's
-    YAW as a wxyz quaternion. The same yaw does both jobs: it carries
-    :data:`HOME_GRIP_FROM_HEAD_XR` onto the head's facing, and :meth:`Follower.anchor`
-    turns the arm by it.
-    """
-    pose = np.asarray(head_pose_xr, dtype=float)
-    q_yaw = yaw_of(pose[3:7])
-    offset = np.empty(3)
-    mujoco.mju_rotVecQuat(offset, HOME_GRIP_FROM_HEAD_XR, q_yaw)
-    return pose[:3] + offset, q_yaw
 
 
 def mj_from_xr_rotation(q_xr_wxyz: np.ndarray) -> np.ndarray:
@@ -467,7 +410,7 @@ class Follower:
         head's yaw is only what turns it to face the operator meanwhile -- from the first
         driven frame the controller owns both position and yaw.
         """
-        home_xr, q_yaw_xr = anchor_from_head(head_pose_xr)
+        home_xr, q_yaw_xr = anchor_from_head(head_pose_xr, HOME_GRIP_FROM_HEAD_XR)
         self._anchored = True
         self._place(home_xr, q_yaw_xr)
         LOG.info(

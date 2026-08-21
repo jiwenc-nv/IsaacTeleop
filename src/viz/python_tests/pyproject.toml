@@ -17,6 +17,10 @@ requires-python = ">=3.11,<3.14"
 dev = [
     "pytest",
     "numpy",
+    # test_robot_mj.py covers isaacteleop.viz.robot.mj, which imports MuJoCo. Without
+    # it here the ctest invocation (`uv run --extra dev`) skips that file on every run.
+    # Same pin as the root `robot-viz` extra; the example's CMake gate checks them.
+    "mujoco==3.11.0",
 ]
 # Opt-in extras that exercise the cuda/numpy interface protocols
 # against real third-party consumers. Either lib is enough; both can

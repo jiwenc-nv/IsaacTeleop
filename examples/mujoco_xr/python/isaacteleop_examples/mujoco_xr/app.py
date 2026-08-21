@@ -3,11 +3,11 @@
 
 """A MuJoCo scene drawn into a Televiz XR session.
 
-One OpenXR session shared between VizSession (rendering) and TeleopSession
+One OpenXR session shared between XrTwinSession (rendering) and TeleopSession
 (input); the scene is drawn by MuJoCo's own renderer and reaches
 ProjectionLayer.submit() by CUDA pointer, never through host memory.
 
-    VizSession(kXr)  ──get_oxr_handles()──▶  TeleopSession
+    XrTwinSession    ──oxr_handles()────▶  TeleopSession
          │                                        │
          │ recommended resolution                 │ EePoseRateLimiter output
          ▼                                        ▼                      │
@@ -16,7 +16,7 @@ ProjectionLayer.submit() by CUDA pointer, never through host memory.
          └──────────────── mjData.mocap_pos/_quat ◀─────────────────────┘
 
 The renderer needs an OpenGL context current on this thread; viz and the renderer
-meet through CUDA alone, on VizSession's GPU. C++ owns
+meet through CUDA alone, on the compositor's GPU. C++ owns
 mjvScene/mjvOption/mjvCamera/mjrContext, Python owns mjModel/mjData.
 
 Nothing is integrated -- mj_step is never called -- which makes one invariant
@@ -41,6 +41,13 @@ import numpy as np
 
 from isaacteleop import viz
 from isaacteleop.cloudxr import CloudXRLauncher
+from isaacteleop.viz.robot.mj import yaw_of_axis
+from isaacteleop.viz.robot import (
+    MIN_QUAT_NORM,
+    VIEW_COUNT,
+    XrTwinSession,
+    head_pose,
+)
 from isaacteleop.oxr import OpenXRSessionHandles
 from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
 from isaacteleop.retargeting_engine.interface import (
@@ -72,26 +79,16 @@ from isaacteleop.teleop_session_manager import (
 )
 
 from . import _mujoco_xr, follower
+from .twin import MujocoTwin
 from .harness import ControllerPoseSource, HandPose, HarnessBand, InterventionMonitor
 
 LOG = logging.getLogger("mujoco_xr")
 
-# The app's only clip planes. VizSessionConfig, the projection and the submitted depth
+# The app's only clip planes. XrTwinSession, the projection and the submitted depth
 # must all agree, or world-locked geometry swims under head motion, and only a headset
 # shows it. There is no near/far literal in cpp/, by construction.
 NEAR_Z = 0.05
 FAR_Z = 50.0
-
-# Wall-clock ceiling for one advance of the app's own clock. See _clamp_dt.
-MAX_DT_S = 0.1
-
-# The only mode: this needs a headset and a CloudXR runtime. A headless fallback
-# should arrive with the CI job that runs it (NVIDIA/IsaacTeleop#880).
-_DISPLAY_MODE = viz.DisplayMode.kXr
-
-# layer.submit() in _loop is spelled out per eye and cannot read this name, so
-# changing it means editing that call too.
-_VIEW_COUNT = 2
 
 _CLOCK_SOURCE = (
     "FrameInfo.predicted_display_time; frames with no prediction are skipped, "
@@ -187,11 +184,6 @@ _YAW_TRIM_BUTTON = ControllerInputIndex.PRIMARY_CLICK
 # of OptionalType, so this key is sent unconditionally.
 ENGAGE_PERMISSION_LEAF = "engage_permission"
 
-# The clutch's own degenerate-quaternion threshold (clutch_retargeter.py:109),
-# restated so `after_step`'s usable-pose test covers its whole disarm set. Reused
-# for the head pose, which has no such consumer but is just as unusable at zero.
-_MIN_QUAT_NORM = 1e-6
-
 # ── Where the ghost sits on the hand ───────────────────────────────────
 # Euler degrees, intrinsic XYZ, i.e. MuJoCo's `euler=`. Solve this rotation from Q_HOME;
 # do not port a grip-measured value, which demands a wrist pitch nobody chose. It fixes
@@ -239,17 +231,6 @@ def _quat_from_euler_deg(angles_deg) -> np.ndarray:
 
 # ── Derived below; nothing from here on is authored ────────────────────────
 _QUAT_HAND_FROM_GHOST = _quat_from_euler_deg(_EULER_HAND_FROM_GHOST_DEG)
-
-
-def _clamp_dt(dt: float) -> float:
-    """NaN-safe clamp into [0, MAX_DT_S].
-
-    Comparisons, not min/max: max(nan, 0) is nan, so the obvious form passes NaN
-    through both limits and into whatever accumulates it.
-    """
-    if dt > 0:
-        return MAX_DT_S if dt > MAX_DT_S else dt
-    return 0.0
 
 
 # ── What the harness lets through ──────────────────────────────────────────
@@ -330,81 +311,6 @@ def _build_pipeline(  # noqa: N803
     )
 
 
-def _head_pose(info) -> np.ndarray | None:
-    """FrameInfo.views[0] as a 7-D XR pose (position, xyzw), or None if unusable.
-
-    The left eye rather than a head centre, which the runtime does not report; the
-    ~32 mm between them is well inside what HOME_GRIP_FROM_HEAD_XR is authored to.
-    """
-    if len(info.views) == 0:
-        return None
-    view = info.views[0]
-    px, py, pz = view.pose.position
-    qw, qx, qy, qz = view.pose.orientation
-    pose = np.array([px, py, pz, qx, qy, qz, qw], dtype=float)
-    if (
-        not np.all(np.isfinite(pose))
-        or float(np.linalg.norm(pose[3:7])) < _MIN_QUAT_NORM
-    ):
-        return None
-    return pose
-
-
-def _flatten_xr_views(info) -> tuple[list[float], list[float]]:
-    """FrameInfo.views -> the flat float arrays the renderer takes.
-
-    Field by field, never sliced: viz.Pose3D.orientation is (w,x,y,z) while a
-    controller's GRIP_ORIENTATION is (x,y,z,w).
-    """
-    poses: list[float] = []
-    fovs: list[float] = []
-    for view in info.views:
-        px, py, pz = view.pose.position
-        qw, qx, qy, qz = view.pose.orientation
-        poses.extend((px, py, pz, qw, qx, qy, qz))
-        fovs.extend(
-            (
-                view.fov.angle_left,
-                view.fov.angle_right,
-                view.fov.angle_up,
-                view.fov.angle_down,
-            )
-        )
-    return poses, fovs
-
-
-def _assert_frustum(f: list[float], fov, near: float, far: float) -> None:
-    """The frustum handed to mjvGLCamera, checked against the fov it came from.
-
-    `f` is (center, half_width, bottom, top, near, far). The projection's shape
-    is MuJoCo's business; which numbers reach it is this app's.
-    """
-    center, half_width, bottom, top, f_near, f_far = f
-
-    # At zero half_width mjr_render derives the horizontal extent from the
-    # viewport aspect, rendering something plausible from a fov carrying nothing.
-    assert half_width > 0.0 and top > bottom, (
-        f"degenerate frustum {f}: a zeroed Fov reached the camera"
-    )
-    # float32 tolerances throughout: the frustum crosses as C floats, so an
-    # exact comparison against a Python float fails on rounding alone.
-    for name, got, want in (
-        ("left", center - half_width, near * math.tan(fov.angle_left)),
-        ("right", center + half_width, near * math.tan(fov.angle_right)),
-        ("bottom", bottom, near * math.tan(fov.angle_down)),
-        ("top", top, near * math.tan(fov.angle_up)),
-    ):
-        assert abs(got - want) <= 1e-6 * max(1.0, abs(want)), (
-            f"frustum {name}={got}, expected {want}"
-        )
-
-    # viz's XrCompositionLayerDepthInfoKHR pair must be the encoding pair, or
-    # the runtime reprojects against the wrong range.
-    assert abs(f_near - near) <= 1e-6 * near and abs(f_far - far) <= 1e-6 * far, (
-        f"clip planes drifted: camera has ({f_near}, {f_far}), viz was told ({near}, {far})"
-    )
-
-
 def _log_startup(resolution, gl_backend: str) -> None:
     """One block naming every assumption that is invisible at runtime."""
     try:
@@ -426,7 +332,7 @@ def _log_startup(resolution, gl_backend: str) -> None:
     )
     LOG.info(
         "views:      %d (stereo)   view resolution: %sx%s",
-        _VIEW_COUNT,
+        VIEW_COUNT,
         resolution.width,
         resolution.height,
     )
@@ -436,7 +342,7 @@ def _log_startup(resolution, gl_backend: str) -> None:
         gl_backend,
     )
     LOG.info(
-        "clip:       near=%.4f far=%.2f (one pair -> VizSessionConfig, projection, submitted depth)",
+        "clip:       near=%.4f far=%.2f (one pair -> XrTwinSession, projection, submitted depth)",
         NEAR_Z,
         FAR_Z,
     )
@@ -658,7 +564,7 @@ _YAW_TRIM_RATE_DEG_S = 20.0
 
 def hand_facing_xr(q_hand_xyzw: np.ndarray) -> np.ndarray:
     """The XR yaw (wxyz) the operator's hand is facing, for the follower's base."""
-    return follower.yaw_of_axis(q_hand_xyzw, _HAND_FORWARD_AXIS)
+    return yaw_of_axis(q_hand_xyzw, _HAND_FORWARD_AXIS)
 
 
 def _log_hand_frames(result) -> bool:
@@ -685,7 +591,7 @@ def _log_hand_frames(result) -> bool:
             controller[ControllerInputIndex.GRIP_POSITION], dtype=float
         )
         aim_pos = np.asarray(controller[ControllerInputIndex.AIM_POSITION], dtype=float)
-        if min(np.linalg.norm(aim), np.linalg.norm(grip)) < _MIN_QUAT_NORM:
+        if min(np.linalg.norm(aim), np.linalg.norm(grip)) < MIN_QUAT_NORM:
             return False
     except (ValueError, IndexError, TypeError):
         return False
@@ -794,18 +700,6 @@ def _log_grip_posture(arm) -> tuple[float, float]:
     return ahead(tool), ahead(hand_axis)
 
 
-def _frame_clock(info) -> float | None:
-    """The app's clock, or None if this frame carries no time.
-
-    viz zeroes predicted_display_time with should_render on every frame before
-    kRunning. The caller must skip the sample rather than record a zero, or the next
-    real frame computes dt from 0 and _clamp_dt reports a full MAX_DT_S stall.
-    """
-    if info.predicted_display_time == 0:
-        return None
-    return info.predicted_display_time / 1e9
-
-
 def run() -> int:
     model = mujoco.MjModel.from_xml_path(str(DEFAULT_SCENE))
     data = mujoco.MjData(model)
@@ -814,7 +708,7 @@ def run() -> int:
     # that waits for the first head pose, in _Preview.before_step.
     arm = follower.Follower(model, data)
 
-    # Order is load-bearing: VizSession calls xrCreateInstance, so an extension
+    # Order is load-bearing: XrTwinSession calls xrCreateInstance, so an extension
     # discovered after it cannot be added, and a controller tracker missing
     # XR_NVX1_action_context is silently dead rather than an error. The clutch's home
     # is pushed every non-ENGAGED frame, so this constructor value only has to be
@@ -822,51 +716,16 @@ def run() -> int:
     pipeline, clutch = _build_pipeline(pose_from_ghost_body(*arm.gripper_pose_mj()))
     required_extensions = get_required_oxr_extensions_from_pipeline(pipeline)
 
-    config = viz.VizSessionConfig()
-    config.mode = _DISPLAY_MODE
-    config.app_name = "MuJoCoXR"
-    config.xr_near_z = NEAR_Z
-    config.xr_far_z = FAR_Z
-    config.required_extensions = required_extensions
-    # Alpha 0 = "show passthrough here", honoured at the runtime's discretion:
-    # viz sets the source-alpha blend bit only for a non-opaque environment, so
-    # a VR headset composites black instead, which is legible rather than broken.
-    config.clear_color = (0.0, 0.0, 0.0, 0.0)
-
-    viz_session = viz.VizSession.create(config)
-    renderer = None
-    gl_context = None
-    try:
-        resolution = viz_session.get_recommended_resolution()
-
-        layer_config = viz.ProjectionLayerConfig()
-        layer_config.name = "mujoco_scene"
-        layer_config.view_resolution = resolution
-        layer_config.color_format = viz.PixelFormat.kRGBA8
-        layer_config.depth_format = viz.PixelFormat.kD32F
-        layer_config.stereo = _VIEW_COUNT == 2
-        layer = viz_session.add_projection_layer(layer_config)
-
-        # After VizSession.create, which cudaSetDevice's the GPU behind its
-        # Vulkan device; the renderer checks this context landed on that one.
-        gl_context = mujoco.GLContext(resolution.width, resolution.height)
-        gl_context.make_current()
-
-        # MuJoCo resolves multisample renderbuffers only inside mjr_readPixels,
-        # which this path never calls, and a multisample source cannot be
-        # blitted with a y flip in one step.
-        model.vis.quality.offsamples = 0
-
-        renderer = _mujoco_xr.Renderer(
-            width=resolution.width,
-            height=resolution.height,
-            view_count=_VIEW_COUNT,
-            near_z=NEAR_Z,
-            far_z=FAR_Z,
-            model_address=model._address,
-        )
-
-        _log_startup(resolution, type(gl_context).__module__)
+    twin = MujocoTwin(model, data)
+    with XrTwinSession(
+        twin,
+        app_name="MuJoCoXR",
+        near_z=NEAR_Z,
+        far_z=FAR_Z,
+        required_extensions=required_extensions,
+        layer_name="mujoco_scene",
+    ) as xr:
+        _log_startup(xr.resolution, twin.gl_backend)
 
         # After the startup block, so its line reads as part of the same report.
         ghost = _resolve_ghost(model)
@@ -895,41 +754,18 @@ def run() -> int:
             math.degrees(_HARNESS.reject_angular_velocity),
         )
 
-        oxr = viz_session.get_oxr_handles()
-        if oxr is None:
-            raise RuntimeError(
-                "VizSession is in kXr mode but produced no OpenXR handles; the backend did not initialize."
-            )
         teleop_config = TeleopSessionConfig(
             app_name="MuJoCoXR",
             pipeline=pipeline,
             # Never pass trackers=: TeleopSession discovers them from the graph,
             # and passing them again duplicates the set.
-            oxr_handles=OpenXRSessionHandles(*oxr),
+            oxr_handles=OpenXRSessionHandles(*xr.oxr_handles()),
         )
         with TeleopSession(teleop_config) as teleop_session:
             try:
-                _loop(
-                    viz_session,
-                    layer,
-                    renderer,
-                    model,
-                    data,
-                    teleop_session,
-                    ghost,
-                    monitor,
-                    arm,
-                    clutch,
-                )
+                _loop(xr, model, data, teleop_session, ghost, monitor, arm, clutch)
             finally:
                 LOG.info(monitor.summary())
-    finally:
-        # Innermost first: the renderer's GL objects need a current context.
-        if renderer is not None:
-            renderer.close()
-        if gl_context is not None:
-            gl_context.free()
-        viz_session.destroy()
     return 0
 
 
@@ -1057,7 +893,7 @@ class _Preview:
         # reads that as a real disengage.
         if hand is not None and (
             not np.all(np.isfinite(hand))
-            or float(np.linalg.norm(hand[3:7])) < _MIN_QUAT_NORM
+            or float(np.linalg.norm(hand[3:7])) < MIN_QUAT_NORM
         ):
             hand = None
 
@@ -1237,88 +1073,17 @@ class _Preview:
         )
 
 
-def _loop(
-    viz_session,
-    layer,
-    renderer,
-    model,
-    data,
-    teleop_session,
-    ghost,
-    monitor,
-    arm,
-    clutch,
-) -> None:
-    view_count = renderer.view_count
-    checked_frustum = False
+def _loop(xr, model, data, teleop_session, ghost, monitor, arm, clutch) -> None:
     preview = _Preview(model, data, ghost, monitor, arm, clutch)
-    previous_clock: float | None = None
-
-    while not viz_session.should_close():
-        info = viz_session.begin_frame()
-        try:
-            # Nothing integrates, so there is no fixed-step accumulator and the whole
-            # frame hangs off should_render. That is also what keeps
-            # teleop_session.step() from calling xrSyncActions on the unthrottled
-            # pre-kRunning burst. The cost is that retargeter compute follows render
-            # cadence; a resumed session sees one large dt, bounded by max_dt.
-            if not info.should_render:
-                continue
-
-            now = _frame_clock(info)
-            dt = (
-                0.0
-                if now is None or previous_clock is None
-                else _clamp_dt(now - previous_clock)
-            )
-            previous_clock = previous_clock if now is None else now
-
-            # Input first, so it precedes everything it feeds. The head pose comes
-            # from this frame's views, which viz only fills past should_render.
-            external_inputs, events = preview.before_step(_head_pose(info))
-            result = teleop_session.step(
-                external_inputs=external_inputs, execution_events=events
-            )
-            preview.after_step(result, dt)
-
-            renderer.update_scene(model._address, data._address)
-            # mjv_updateScene truncates on overflow and returns normally, with
-            # only a stderr warning nobody reads in a frame loop.
-            if renderer.ngeom >= renderer.maxgeom:
-                raise RuntimeError(
-                    f"mjvScene is full: ngeom={renderer.ngeom} maxgeom={renderer.maxgeom}. "
-                    "Geometry is being dropped -- raise kMaxGeom in "
-                    "cpp/scene_renderer.cpp."
-                )
-
-            # No view-count check here: render() sees the flattened lengths and
-            # rejects a mismatch in those terms.
-            poses, fovs = _flatten_xr_views(info)
-            renderer.render(poses, fovs)
-
-            # First rendered frame only: the fov changes per frame, the
-            # convention does not.
-            if not checked_frustum:
-                for view in range(view_count):
-                    _assert_frustum(
-                        renderer.frustum(view), info.views[view].fov, NEAR_Z, FAR_Z
-                    )
-                LOG.info(
-                    "frustum verified on the first rendered frame (matches FrameInfo fov, clip planes agree "
-                    "with VizSessionConfig)"
-                )
-                checked_frustum = True
-
-            layer.submit(
-                renderer.color(0),
-                renderer.depth(0),
-                renderer.color(1),
-                renderer.depth(1),
-            )
-        finally:
-            # Follows EVERY begin_frame(), including the should_render == False
-            # path and any exception above. Skipping it wedges the frame loop.
-            viz_session.end_frame()
+    for frame in xr.frames():
+        # Input first, so it precedes everything it feeds. The head pose comes from
+        # this frame's views, which viz only fills past should_render.
+        external_inputs, events = preview.before_step(head_pose(frame.info))
+        result = teleop_session.step(
+            external_inputs=external_inputs, execution_events=events
+        )
+        preview.after_step(result, frame.dt)
+        xr.render(frame)
 
 
 def main(argv: list[str]) -> int:

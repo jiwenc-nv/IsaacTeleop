@@ -45,7 +45,7 @@ dependencies = [
     # this resolves happily against a release that is not this checkout's viz.
     # Install the locally built wheel first, into the same environment:
     #   uv pip install "isaacteleop[cloudxr]" --find-links=./install/wheels/
-    "isaacteleop",
+    "isaacteleop[robot-viz]",
     # app.py imports numpy directly. mujoco would pull it in anyway, but a
     # transitive dependency imported by name breaks on an upstream change.
     "numpy",

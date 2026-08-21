@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# `isaacteleop.viz.robot.mj`. Pin rationale lives in the repo-root pyproject.toml;
+# examples/mujoco_xr/CMakeLists.txt fails the configure when these drift apart.
+mujoco==3.11.0

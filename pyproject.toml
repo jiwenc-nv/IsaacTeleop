@@ -62,6 +62,15 @@ cloudxr = [
     "cryptography>=3.0",
     "websockets>=14.0",
 ]
+# `isaacteleop.viz.robot.mj`, which uses MuJoCo as a quaternion library.
+#
+# Exact, and matched to examples/mujoco_xr's pin rather than derived here: exactly one
+# libmujoco may be loaded per process, and that example's extension links one by SONAME.
+# Nothing installed by this extra links it. examples/mujoco_xr/CMakeLists.txt fails the
+# configure when the pins drift apart.
+robot-viz = [
+    "mujoco==3.11.0",
+]
 
 # Derive the version from the VERSION file (MAJOR.MINOR.x) as MAJOR.MINOR+local,
 # matching what the classic flow (cmake/IsaacTeleopVersion.cmake) emits for a
